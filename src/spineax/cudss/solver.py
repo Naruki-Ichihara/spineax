@@ -1,4 +1,5 @@
 import functools as ft
+import itertools
 import jax
 import jax.core
 import jax.extend.core
@@ -8,6 +9,8 @@ from jaxtyping import Array
 import numpy as np
 import equinox as eqx
 import jax.experimental.sparse as jsparse
+
+_solver_id_counter = itertools.count()
 
 # Force JAX to initialize CUDA context BEFORE importing my C++ functions!!!!!!!!
 jax.devices()
@@ -138,6 +141,9 @@ def general_single_solve_impl(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id,
         device_id,
         mtype_id,
         mview_id
@@ -159,6 +165,9 @@ def general_single_solve_impl(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id = solver_id,
         device_id = device_id,
         mtype_id = mtype_id,
         mview_id = mview_id,
@@ -242,6 +251,9 @@ def general_pbatch_solve_impl(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id,
         batch_size,
         device_id,
         mtype_id,
@@ -264,6 +276,9 @@ def general_pbatch_solve_impl(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id = solver_id,
         batch_size = batch_size,
         device_id = device_id,
         mtype_id = mtype_id,
@@ -346,6 +361,9 @@ def solve_aval(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id,
         device_id,
         mtype_id,
         mview_id
@@ -384,6 +402,9 @@ def solve_pbatch_aval(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id,
         batch_size,
         device_id,
         mtype_id,
@@ -397,6 +418,7 @@ def solve_pbatch_aval(
 # single solve interface =======================================================
 @ft.partial(
     jax.jit, static_argnames=[
+        "solver_id",
         "device_id",
         "mtype_id",
         "mview_id"
@@ -408,6 +430,9 @@ def solve(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id,
         device_id,
         mtype_id,
         mview_id
@@ -431,6 +456,9 @@ def solve(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id = solver_id,
         device_id = device_id,
         mtype_id = mtype_id,
         mview_id = mview_id,
@@ -483,6 +511,7 @@ def batch_solve(
 # manual psuedo batch solve interface =================================================
 @ft.partial(
     jax.jit, static_argnames=[
+        "solver_id",
         "batch_size",
         "device_id",
         "mtype_id",
@@ -495,6 +524,9 @@ def pbatch_solve(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id,
         batch_size,
         device_id,
         mtype_id,
@@ -519,6 +551,9 @@ def pbatch_solve(
         csr_offsets,
         csr_columns,
         refactorize_signal,
+        solve_signal,
+        ir_nsteps_signal,
+        solver_id = solver_id,
         batch_size = batch_size,
         device_id = device_id,
         mtype_id = mtype_id,
@@ -539,15 +574,15 @@ def solve_single_c128_vmap(vector_arg_values, batch_axes, **kwargs):
 vmap_using_pseudo_batch = True
 
 def general_solve_vmap(
-    vector_arg_values: tuple[Array, ...],       # [b_values, csr_values, csr_offsets, csr_columns, refactorize_signal]
+    vector_arg_values: tuple[Array, ...],       # [b_values, csr_values, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal]
     batch_axes: tuple[int | None, ...],         # batch axes for each arg
     **kwargs                                    # static params
 ) -> Array:
 
-    b_values, csr_values, csr_offsets, csr_columns, refactorize_signal = vector_arg_values
-    a_b, a_val, a_off, a_col, a_refac = batch_axes
+    b_values, csr_values, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal = vector_arg_values
+    a_b, a_val, a_off, a_col, a_refac, a_solve, a_ir = batch_axes
 
-    # Handle spurious batch axes on sparsity patterns and refactorize_signal.
+    # Handle spurious batch axes on sparsity patterns and signals.
     # This happens when the solve is inside a jax.lax.switch that gets vmapped -
     # JAX broadcasts all branch inputs to have batch dimensions, even constants.
     # Since these are the same across all batch elements, extract first.
@@ -560,9 +595,15 @@ def general_solve_vmap(
     if a_refac is not None:
         refactorize_signal = jax.lax.index_in_dim(refactorize_signal, 0, axis=a_refac, keepdims=False)
         a_refac = None
+    if a_solve is not None:
+        solve_signal = jax.lax.index_in_dim(solve_signal, 0, axis=a_solve, keepdims=False)
+        a_solve = None
+    if a_ir is not None:
+        ir_nsteps_signal = jax.lax.index_in_dim(ir_nsteps_signal, 0, axis=a_ir, keepdims=False)
+        a_ir = None
 
     # Update vector_arg_values with the corrected values
-    vector_arg_values = (b_values, csr_values, csr_offsets, csr_columns, refactorize_signal)
+    vector_arg_values = (b_values, csr_values, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal)
 
     # guards (these should never trigger now since we handle spurious batch axes above)
     if any(ax is not None for ax in (a_off, a_col)):
@@ -620,10 +661,10 @@ batching.primitive_batchers[solve_single_c128_p] = solve_single_c128_vmap
 # vmap of vmap
 def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
     """Handle vmap of already-batched solve"""
-    b_values, csr_values, csr_offsets, csr_columns, refactorize_signal = vector_arg_values
-    a_b, a_val, a_off, a_col, a_refac = batch_axes
+    b_values, csr_values, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal = vector_arg_values
+    a_b, a_val, a_off, a_col, a_refac, a_solve, a_ir = batch_axes
 
-    # Handle spurious batch axes on sparsity patterns and refactorize_signal (same fix as general_solve_vmap)
+    # Handle spurious batch axes on sparsity patterns and signals (same fix as general_solve_vmap)
     if a_off is not None:
         csr_offsets = jax.lax.index_in_dim(csr_offsets, 0, axis=a_off, keepdims=False)
         a_off = None
@@ -633,13 +674,19 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
     if a_refac is not None:
         refactorize_signal = jax.lax.index_in_dim(refactorize_signal, 0, axis=a_refac, keepdims=False)
         a_refac = None
-    vector_arg_values = (b_values, csr_values, csr_offsets, csr_columns, refactorize_signal)
+    if a_solve is not None:
+        solve_signal = jax.lax.index_in_dim(solve_signal, 0, axis=a_solve, keepdims=False)
+        a_solve = None
+    if a_ir is not None:
+        ir_nsteps_signal = jax.lax.index_in_dim(ir_nsteps_signal, 0, axis=a_ir, keepdims=False)
+        a_ir = None
+    vector_arg_values = (b_values, csr_values, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal)
 
     if any(ax is not None for ax in (a_off, a_col)):
         raise NotImplementedError("don't support batches of heterogeneous sparsity patterns yet (its coming tho...)")
 
-    if a_refac is not None:
-        raise NotImplementedError("don't support per-element batching of refactorize_signal")
+    # if a_refac is not None:
+    #     raise NotImplementedError("don't support per-element batching of refactorize_signal")
 
     if a_b is None and a_val is None:
         # Not actually batching
@@ -689,7 +736,7 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
     kwargs.__delitem__("batch_size")
 
     x_flat, inertia_flat = solver.bind(
-        b_flat, csr_flat, csr_offsets, csr_columns, refactorize_signal,
+        b_flat, csr_flat, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal,
         batch_size=total_batch,
         **kwargs
     )
@@ -710,6 +757,7 @@ class CuDSSSolver(eqx.Module):
     """Sparse linear solver wrapper that marks sparsity pattern as static for vmap."""
     csr_offsets: Array # = eqx.field(static=True)
     csr_columns: Array # = eqx.field(static=True)
+    solver_id: int = eqx.field(static=True)  # must be static (FFI attribute)
     device_id: int = eqx.field(static=True)
     mtype_id: int = eqx.field(static=True)
     mview_id: int = eqx.field(static=True)
@@ -717,15 +765,21 @@ class CuDSSSolver(eqx.Module):
     def __init__(self, csr_offsets, csr_columns, device_id, mtype_id, mview_id):
         self.csr_offsets = csr_offsets
         self.csr_columns = csr_columns
+        self.solver_id = next(_solver_id_counter)
         self.device_id = device_id
         self.mtype_id = mtype_id
         self.mview_id = mview_id
 
-    def __call__(self, b, csr_values, refactorize_signal):
+    def __call__(self, b, csr_values, refactorize_signal, solve_signal, ir_nsteps_signal=None):
+        if ir_nsteps_signal is None:
+            ir_nsteps_signal = jnp.array([5], dtype=jnp.int32)
         return solve(b, csr_values,
             csr_offsets=self.csr_offsets,
             csr_columns=self.csr_columns,
             refactorize_signal=refactorize_signal,
+            solve_signal=solve_signal,
+            ir_nsteps_signal=ir_nsteps_signal,
+            solver_id=self.solver_id,
             device_id=self.device_id,
             mtype_id=self.mtype_id,
             mview_id=self.mview_id
@@ -855,12 +909,12 @@ def run_diagonal_tests(batch_sizes=[1, 4, 16]):
             print(f"\n--- Batch size: {batch_size} ---")
 
             if batch_size == 1:
-                sol, inertia = solver(b, csr_values)
+                sol, inertia = solver(b, csr_values, jnp.array([1], dtype=jnp.int32), jnp.array([1], dtype=jnp.int32))
                 print(f"Reported inertia: {inertia}")
             else:
                 b_batch = jnp.stack([b] * batch_size)
                 csr_batch = jnp.stack([csr_values] * batch_size)
-                sol, inertia = jax.jit(jax.vmap(solver))(b_batch, csr_batch)
+                sol, inertia = jax.jit(jax.vmap(solver))(b_batch, csr_batch, )
                 print(f"Reported inertia (first 4):\n{inertia[:4]}")
 
                 # Check for non-determinism
@@ -952,15 +1006,17 @@ if __name__ == "__main__":
 
     # call it - dispatches single solve by default
     single_solver = eqx.filter_jit(solver) # has to be filter_jitted, where vmap does not
-    test1, in1 = single_solver(b[0], csr_values[0], jnp.array([1], dtype=jnp.int32))
-    test1, in1 = single_solver(b[0], csr_values[0], refactorize_signal=jnp.array([1], dtype=jnp.int32))
-    test1, in1 = single_solver(b[0], csr_values[0], refactorize_signal=jnp.array([1], dtype=jnp.int32))
+    # test1, in1 = single_solver(b[0], csr_values[0], jnp.array([1], dtype=jnp.int32), jnp.array([1], dtype=jnp.int32))
+    test1, in1 = single_solver(b[0], csr_values[0], refactorize_signal=jnp.array([1], dtype=jnp.int32), solve_signal=jnp.array([1], dtype=jnp.int32))
+    test1, in1 = single_solver(b[0], csr_values[0], refactorize_signal=jnp.array([1], dtype=jnp.int32), solve_signal=jnp.array([1], dtype=jnp.int32))
+    test1, in1 = single_solver(b[0], csr_values[0], refactorize_signal=jnp.array([1], dtype=jnp.int32), solve_signal=jnp.array([0], dtype=jnp.int32))
+    test1, in1 = single_solver(b[0], csr_values[0], refactorize_signal=jnp.array([1], dtype=jnp.int32), solve_signal=jnp.array([0], dtype=jnp.int32))
 
     # call it in vmap/jit
-    batch_solver = jax.jit(jax.vmap(solver, in_axes=(0,0,None)))
-    test2, in2 = batch_solver(b, csr_values, jnp.array([1], dtype=jnp.int32))
-    test2, in2 = batch_solver(b, csr_values, jnp.array([1], dtype=jnp.int32))
-    test2, in2 = batch_solver(b, csr_values, jnp.array([1], dtype=jnp.int32))
+    batch_solver = jax.jit(jax.vmap(solver, in_axes=(0,0,None,None)))
+    test2, in2 = batch_solver(b, csr_values, jnp.array([1], dtype=jnp.int32), jnp.array([1], dtype=jnp.int32))
+    test2, in2 = batch_solver(b, csr_values, jnp.array([1], dtype=jnp.int32), jnp.array([0], dtype=jnp.int32))
+    test2, in2 = batch_solver(b, csr_values, jnp.array([1], dtype=jnp.int32), jnp.array([1], dtype=jnp.int32))
 
     # unlimited composability in jit/vmap
     b_ = jnp.stack([jnp.stack([b,b]), jnp.stack([b,b])])
