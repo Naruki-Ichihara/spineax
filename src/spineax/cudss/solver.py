@@ -4,6 +4,7 @@ import jax
 import jax.core
 import jax.extend.core
 from jax.interpreters import mlir, batching
+from jax._src import effects as effects_lib
 import jax.numpy as jnp
 from jaxtyping import Array
 import numpy as np
@@ -11,6 +12,15 @@ import equinox as eqx
 import jax.experimental.sparse as jsparse
 
 _solver_id_counter = itertools.count()
+
+# Effect to prevent JAX's jaxpr-level DCE from eliminating solver calls
+# whose outputs are unused (e.g., refactorize-only calls)
+class _CudssSolverEffect(effects_lib.Effect):
+    pass
+
+_cudss_effect = _CudssSolverEffect()
+effects_lib.lowerable_effects.add_type(_CudssSolverEffect)
+effects_lib.control_flow_allowed_effects.add_type(_CudssSolverEffect)
 
 # Force JAX to initialize CUDA context BEFORE importing my C++ functions!!!!!!!!
 jax.devices()
@@ -351,10 +361,10 @@ solve_pbatch_c128_low = mlir.lower_fun(solve_pbatch_c128_impl, multiple_results=
 mlir.register_lowering(solve_pbatch_c128_p, solve_pbatch_c128_low)
 
 # abstract evaluations =========================================================
-@solve_single_f32_p.def_abstract_eval
-@solve_single_f64_p.def_abstract_eval
-@solve_single_c64_p.def_abstract_eval
-@solve_single_c128_p.def_abstract_eval
+@solve_single_f32_p.def_effectful_abstract_eval
+@solve_single_f64_p.def_effectful_abstract_eval
+@solve_single_c64_p.def_effectful_abstract_eval
+@solve_single_c128_p.def_effectful_abstract_eval
 def solve_aval(
         b_values,
         csr_values,
@@ -371,31 +381,31 @@ def solve_aval(
     return [
             jax.core.ShapedArray(b_values.shape, b_values.dtype),       # x
             jax.core.ShapedArray((2,), jnp.int32),                      # inertia [positive, negative]
-        ]
+        ], {_cudss_effect}
 
-@solve_batch_f32_p.def_abstract_eval
-@solve_batch_f64_p.def_abstract_eval
-@solve_batch_c64_p.def_abstract_eval
-@solve_batch_c128_p.def_abstract_eval
+@solve_batch_f32_p.def_effectful_abstract_eval
+@solve_batch_f64_p.def_effectful_abstract_eval
+@solve_batch_c64_p.def_effectful_abstract_eval
+@solve_batch_c128_p.def_effectful_abstract_eval
 def solve_batch_aval(
-        b_values, 
-        csr_values, 
+        b_values,
+        csr_values,
         csr_offsets,
         csr_columns,
         batch_size,
-        device_id, 
-        mtype_id, 
+        device_id,
+        mtype_id,
         mview_id
     ):
     return [
             jax.core.ShapedArray(b_values.shape, b_values.dtype),       # x
             jax.core.ShapedArray((batch_size, 2), jnp.int32),           # inertia [positive, negative]
-        ]
+        ], {_cudss_effect}
 
-@solve_pbatch_f32_p.def_abstract_eval
-@solve_pbatch_f64_p.def_abstract_eval
-@solve_pbatch_c64_p.def_abstract_eval
-@solve_pbatch_c128_p.def_abstract_eval
+@solve_pbatch_f32_p.def_effectful_abstract_eval
+@solve_pbatch_f64_p.def_effectful_abstract_eval
+@solve_pbatch_c64_p.def_effectful_abstract_eval
+@solve_pbatch_c128_p.def_effectful_abstract_eval
 def solve_pbatch_aval(
         b_values,
         csr_values,
@@ -413,7 +423,7 @@ def solve_pbatch_aval(
     return [
             jax.core.ShapedArray(b_values.shape, b_values.dtype),       # x
             jax.core.ShapedArray((batch_size, 2), jnp.int32),           # inertia [positive, negative]
-        ]
+        ], {_cudss_effect}
 
 # single solve interface =======================================================
 @ft.partial(
