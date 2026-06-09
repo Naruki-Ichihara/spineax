@@ -146,7 +146,20 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
+# Build device code for the GPU(s) present on the build machine by default.
+# Must be set BEFORE enable_language(CUDA): that call otherwise caches nvcc's
+# default arch (sm_75) and ships only PTX for newer GPUs (e.g. Blackwell sm_120).
+# The driver then has to JIT that PTX at kernel launch, and if the toolkit's PTX
+# ISA is newer than the installed driver supports it fails at runtime with
+# cudaErrorUnsupportedPtxVersion. Emitting a native cubin for the real arch
+# avoids the JIT entirely.
+# Override with -DCMAKE_CUDA_ARCHITECTURES=120 (or a list) when cross-building.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 enable_language(CUDA)
+message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 # Option to disable pbatch_solve (useful when nvcc version doesn't match CUDA runtime)
 option(BUILD_PBATCH_SOLVE "Build pseudo batch solve module (requires matching nvcc)" ON)
