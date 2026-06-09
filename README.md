@@ -12,7 +12,7 @@ For those that need sparsity pattern detection for jax jacobians/hessians I also
 
 ## cuDSS
 
-I expose ***most*** features of cuDSS (as of 0.7.0) to JAX with ***zero-copy arrays*** and ***full FFI jit/vmap integration*** with ***XLA state management*** including custom batching functionality to expose more information than cuDSS currently supports.
+I expose ***most*** features of cuDSS (as of 0.8.0) to JAX with ***zero-copy arrays*** and ***full FFI jit/vmap integration*** with ***XLA state management*** including custom batching functionality to expose more information than cuDSS currently supports.
 
 This currently supports:
 - ✅ ***zero-copies between JAX and cuDSS***

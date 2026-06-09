@@ -77,11 +77,11 @@ void print_device_data(
 }
 
 // Helper function for data types ==============================================
-template <ffi::DataType T> cudaDataType get_cuda_data_type();
-template<> cudaDataType get_cuda_data_type<ffi::F32>() { return CUDA_R_32F; }
-template<> cudaDataType get_cuda_data_type<ffi::F64>() { return CUDA_R_64F; }
-template<> cudaDataType get_cuda_data_type<ffi::C64>() { return CUDA_C_32F; }
-template<> cudaDataType get_cuda_data_type<ffi::C128>() { return CUDA_C_64F; }
+template <ffi::DataType T> cudssDataType_t get_cudss_data_type();
+template<> cudssDataType_t get_cudss_data_type<ffi::F32>() { return CUDSS_R_32F; }
+template<> cudssDataType_t get_cudss_data_type<ffi::F64>() { return CUDSS_R_64F; }
+template<> cudssDataType_t get_cudss_data_type<ffi::C64>() { return CUDSS_C_32F; }
+template<> cudssDataType_t get_cudss_data_type<ffi::C128>() { return CUDSS_C_64F; }
 
 template <ffi::DataType T>
 struct get_native_data_type;
@@ -110,7 +110,7 @@ struct CudssState {
     int64_t nrhs = 0;
     int64_t call_count = 0; // necessary for detecting if we need further instantiation in execution stage
     size_t sizeWritten = 0;
-    cudaDataType cuda_dtype = get_cuda_data_type<T>();
+    cudssDataType_t cudss_dtype = get_cudss_data_type<T>();
 
     // this is literally only for debugging
     using native_dtype = typename get_native_data_type<T>::type;
@@ -232,16 +232,16 @@ static ffi::Error CudssExecute(
 
         // CuDSS structures creation
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, state->n, state->nrhs, state->n,
-            b_values_buf.typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
+            b_values_buf.typed_data(), state->cudss_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
 
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, state->n, state->nrhs, state->n,
-            out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
+            out_values_buf->typed_data(), state->cudss_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
 
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, state->n, state->n, state->nnz,
             offsets_buf.typed_data(), NULL,
             columns_buf.typed_data(),
             csr_values_buf.typed_data(),
-            CUDA_R_32I, state->cuda_dtype,
+            CUDSS_R_32I, CUDSS_R_32I, state->cudss_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
 
         // CuDSS config
