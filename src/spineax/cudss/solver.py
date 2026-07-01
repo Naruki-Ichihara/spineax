@@ -266,7 +266,7 @@ def general_pbatch_solve_impl(
     # Compute inertia instead of returning diag and perm
     matrix_dim = b_values.shape[1]  # Assuming b_values shape is (batch_size, n)
     inertia = compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim)
-    jax.debug.print("inertia: {}", inertia)
+    # jax.debug.print("inertia: {}", inertia)  # debug (silenced)
     return [x, inertia]
 
 # registrations and lowerings ==================================================
@@ -548,8 +548,8 @@ def general_solve_vmap(
     b_values, csr_values, csr_offsets, csr_columns = vector_arg_values
     a_b, a_val, a_off, a_col = batch_axes
 
-    # Debug output
-    jax.debug.print("vmap batch_axes: a_b={}, a_val={}, a_off={}, a_col={}", a_b, a_val, a_off, a_col)
+    # Debug output (silenced)
+    # jax.debug.print("vmap batch_axes: a_b={}, a_val={}, a_off={}, a_col={}", a_b, a_val, a_off, a_col)
 
     # Handle spurious batch axes on sparsity patterns.
     # This happens when the solve is inside a jax.lax.switch that gets vmapped -
