@@ -409,10 +409,8 @@ def solve(
         mview_id
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
         solver = solve_single_f32_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
         solver = solve_single_f64_p
     elif csr_values.dtype == jnp.complex64:
         solver = solve_single_c64_p
@@ -451,10 +449,8 @@ def batch_solve(
         mview_id
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
         solver = solve_batch_f32_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
         solver = solve_batch_f64_p
     elif csr_values.dtype == jnp.complex64:
         solver = solve_batch_c64_p
@@ -495,10 +491,8 @@ def pbatch_solve(
         mview_id
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
         solver = solve_pbatch_f32_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
         solver = solve_pbatch_f64_p
     elif csr_values.dtype == jnp.complex64:
         solver = solve_pbatch_c64_p
