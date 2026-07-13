@@ -25,6 +25,7 @@ they officially support it
 #include "xla/ffi/api/ffi.h"
 #include "cudss.h"
 #include <mutex>
+#include <map>
 #include <unordered_map>
 
 namespace ffi = xla::ffi;
@@ -160,22 +161,27 @@ template <> ffi::TypeId CudssBatchState<ffi::F64>::id = {};
 template <> ffi::TypeId CudssBatchState<ffi::C64>::id = {};
 template <> ffi::TypeId CudssBatchState<ffi::C128>::id = {};
 
-// Global registry: all custom_calls from the same Python CuDSSSolver share one CudssBatchSharedState
+// Global registry: all custom_calls from the same Python CuDSSSolver share one CudssBatchSharedState.
+// Keyed by (solver_id, batch_size): the batched CSR structures and dense matrices are
+// sized for a specific batch size, so executables with different batch sizes (e.g.
+// nested vmap flattening) must NOT share cuDSS state — reusing a smaller batch's
+// structures leaves the tail of the output buffer unsolved.
 template <ffi::DataType T>
 struct CudssBatchRegistry {
     static std::mutex mtx;
-    static std::unordered_map<int64_t, std::shared_ptr<CudssBatchSharedState<T>>> states;
-    static std::shared_ptr<CudssBatchSharedState<T>> get_or_create(int64_t solver_id) {
+    static std::map<std::pair<int64_t, int64_t>, std::shared_ptr<CudssBatchSharedState<T>>> states;
+    static std::shared_ptr<CudssBatchSharedState<T>> get_or_create(int64_t solver_id, int64_t batch_size) {
         std::lock_guard<std::mutex> lock(mtx);
-        auto it = states.find(solver_id);
+        auto key = std::make_pair(solver_id, batch_size);
+        auto it = states.find(key);
         if (it != states.end()) return it->second;
         auto s = std::make_shared<CudssBatchSharedState<T>>();
-        states[solver_id] = s;
+        states[key] = s;
         return s;
     }
 };
 template <ffi::DataType T> std::mutex CudssBatchRegistry<T>::mtx;
-template <ffi::DataType T> std::unordered_map<int64_t, std::shared_ptr<CudssBatchSharedState<T>>> CudssBatchRegistry<T>::states;
+template <ffi::DataType T> std::map<std::pair<int64_t, int64_t>, std::shared_ptr<CudssBatchSharedState<T>>> CudssBatchRegistry<T>::states;
 
 // instantiate =================================================================
 // create everything that is not a function of the context (cudaStream_t)
@@ -189,7 +195,7 @@ static ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>> CudssInstantiate(
 ) {
 
     // Look up or create shared state from the global registry
-    auto shared = CudssBatchRegistry<T>::get_or_create(solver_id);
+    auto shared = CudssBatchRegistry<T>::get_or_create(solver_id, batch_size_64);
 
     // Create the thin wrapper that XLA will manage
     auto wrapper = std::make_unique<CudssBatchState<T>>();
