@@ -24,6 +24,9 @@ they officially support it
 #include "nanobind/nanobind.h"
 #include "xla/ffi/api/ffi.h"
 #include "cudss.h"
+#include <mutex>
+#include <map>
+#include <unordered_map>
 
 namespace ffi = xla::ffi;
 namespace nb = nanobind;
@@ -80,11 +83,11 @@ void print_device_data(
 
 
 // Helper function for data types ==============================================
-template <ffi::DataType T> cudaDataType get_cuda_data_type();
-template<> cudaDataType get_cuda_data_type<ffi::F32>() { return CUDA_R_32F; }
-template<> cudaDataType get_cuda_data_type<ffi::F64>() { return CUDA_R_64F; }
-template<> cudaDataType get_cuda_data_type<ffi::C64>() { return CUDA_C_32F; }
-template<> cudaDataType get_cuda_data_type<ffi::C128>() { return CUDA_C_64F; }
+template <ffi::DataType T> cudssDataType_t get_cudss_data_type();
+template<> cudssDataType_t get_cudss_data_type<ffi::F32>() { return CUDSS_R_32F; }
+template<> cudssDataType_t get_cudss_data_type<ffi::F64>() { return CUDSS_R_64F; }
+template<> cudssDataType_t get_cudss_data_type<ffi::C64>() { return CUDSS_C_32F; }
+template<> cudssDataType_t get_cudss_data_type<ffi::C128>() { return CUDSS_C_64F; }
 
 template <ffi::DataType T>
 struct get_native_data_type;
@@ -95,8 +98,7 @@ template<> struct get_native_data_type<ffi::C128> { using type = std::complex<do
 
 // Structure definitions =======================================================
 template <ffi::DataType T>
-struct CudssBatchState {
-    static xla::ffi::TypeId id;
+struct CudssBatchSharedState {
     cudssHandle_t handle = nullptr;
     cudssConfig_t config = nullptr;
     cudssData_t data = nullptr;
@@ -109,14 +111,15 @@ struct CudssBatchState {
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
     int32_t* batched_offsets_ptr = nullptr; // the pseudo batch must form these manually in C++
     int32_t* batched_columns_ptr = nullptr; // the pseudo batch must form these manually in C++
-    typename get_native_data_type<T>::type* diag_temp = nullptr; // temporary storage for diagonal values
-    int32_t* perm_temp = nullptr; // temporary storage for permutation
     int64_t n;
     int64_t nnz;
     int64_t nrhs;
     int64_t call_count = 0; // necessary for detecting if we need further instantiation in execution stage
     size_t sizeWritten;
-    cudaDataType cuda_dtype = get_cuda_data_type<T>();
+    int32_t do_refactorize; // host-side flag read from traced GPU signal
+    int32_t do_solve; // host-side flag read from traced GPU signal
+    int32_t ir_nsteps; // host-side value read from traced GPU signal
+    cudssDataType_t cudss_dtype = get_cudss_data_type<T>();
 
     // Cache pointer addresses to detect if sparsity pattern has changed
     int32_t* cached_offsets_ptr = nullptr;
@@ -125,21 +128,32 @@ struct CudssBatchState {
     // this is literally only for debugging
     using native_dtype = typename get_native_data_type<T>::type;
 
-    ~CudssBatchState() {
-        if (handle) {
-            // CuDSS destruction
-            cudssMatrixDestroy(A);
-            cudssMatrixDestroy(b);
-            cudssMatrixDestroy(x);
-            cudssDataDestroy(handle, data);
-            cudssConfigDestroy(config);
-            cudssDestroy(handle);
-        }
-        if (diag_temp) cudaFree(diag_temp);
-        if (perm_temp) cudaFree(perm_temp);
-        if (batched_offsets_ptr) cudaFree(batched_offsets_ptr);
-        if (batched_columns_ptr) cudaFree(batched_columns_ptr);
+    ~CudssBatchSharedState() {
+        // TODO: Fix destructor - currently causes double free on CUDA 13 / cuDSS 0.7
+        // The issue is likely related to cudaMallocAsync/cudaFree mismatch or
+        // destruction order of cuDSS objects that reference batched_*_ptr memory.
+        // For now, we leak memory to avoid the crash.
+
+        // cudaDeviceSynchronize();
+        //
+        // if (handle) {
+        //     cudssMatrixDestroy(A);
+        //     cudssMatrixDestroy(b);
+        //     cudssMatrixDestroy(x);
+        //     cudssDataDestroy(handle, data);
+        //     cudssConfigDestroy(config);
+        //     cudssDestroy(handle);
+        // }
+        // if (batched_offsets_ptr) cudaFree(batched_offsets_ptr);
+        // if (batched_columns_ptr) cudaFree(batched_columns_ptr);
     }
+};
+
+// Thin wrapper that XLA FFI State<T> manages; points to shared state via registry
+template <ffi::DataType T>
+struct CudssBatchState {
+    static xla::ffi::TypeId id;
+    std::shared_ptr<CudssBatchSharedState<T>> shared;
 };
 
 template <> ffi::TypeId CudssBatchState<ffi::F32>::id = {};
@@ -147,70 +161,81 @@ template <> ffi::TypeId CudssBatchState<ffi::F64>::id = {};
 template <> ffi::TypeId CudssBatchState<ffi::C64>::id = {};
 template <> ffi::TypeId CudssBatchState<ffi::C128>::id = {};
 
+// Global registry: all custom_calls from the same Python CuDSSSolver share one CudssBatchSharedState.
+// Keyed by (solver_id, batch_size): the batched CSR structures and dense matrices are
+// sized for a specific batch size, so executables with different batch sizes (e.g.
+// nested vmap flattening) must NOT share cuDSS state — reusing a smaller batch's
+// structures leaves the tail of the output buffer unsolved.
+template <ffi::DataType T>
+struct CudssBatchRegistry {
+    static std::mutex mtx;
+    static std::map<std::pair<int64_t, int64_t>, std::shared_ptr<CudssBatchSharedState<T>>> states;
+    static std::shared_ptr<CudssBatchSharedState<T>> get_or_create(int64_t solver_id, int64_t batch_size) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto key = std::make_pair(solver_id, batch_size);
+        auto it = states.find(key);
+        if (it != states.end()) return it->second;
+        auto s = std::make_shared<CudssBatchSharedState<T>>();
+        states[key] = s;
+        return s;
+    }
+};
+template <ffi::DataType T> std::mutex CudssBatchRegistry<T>::mtx;
+template <ffi::DataType T> std::map<std::pair<int64_t, int64_t>, std::shared_ptr<CudssBatchSharedState<T>>> CudssBatchRegistry<T>::states;
+
 // instantiate =================================================================
 // create everything that is not a function of the context (cudaStream_t)
 template <ffi::DataType T>
 static ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>> CudssInstantiate(
+    const int64_t solver_id,                // unique id for shared state registry
     const int64_t batch_size_64,               // need to know without other structural data
     const int64_t device_id,                // the device to run this on
     const int64_t mtype_id,                 // {0: gen, 1: sym, 2: herm, 3: spd, 4: hpd}
     const int64_t mview_id                  // {0: full, 1: triu, 2: tril}
 ) {
 
-    // printf("in pseudo batch instantiate\n");
+    // Look up or create shared state from the global registry
+    auto shared = CudssBatchRegistry<T>::get_or_create(solver_id, batch_size_64);
 
-    // printf("in instantiate\n");
-    // make a new state which will manage CuDSS's state
-    auto state = std::make_unique<CudssBatchState<T>>();
+    // Create the thin wrapper that XLA will manage
+    auto wrapper = std::make_unique<CudssBatchState<T>>();
+    wrapper->shared = shared;
 
-    // check on the type of matrix being solved
-    if (mtype_id == 0) {
-        // printf("general matrix chosen\n");
-        state->mtype = CUDSS_MTYPE_GENERAL;
-    } else if (mtype_id == 1) {
-        // printf("symmetric matrix chosen\n");
-        state->mtype = CUDSS_MTYPE_SYMMETRIC;
-    } else if (mtype_id == 2) {
-        // printf("hermitian matrix chosen\n");
-        state->mtype = CUDSS_MTYPE_HERMITIAN;
-    } else if (mtype_id == 3) {
-        // printf("symmetric PD matrix chosen\n");
-        state->mtype = CUDSS_MTYPE_SPD;
-    } else if (mtype_id == 4) {
-        // printf("hermitian PD matrix chosen\n");
-        state->mtype = CUDSS_MTYPE_HPD;
-    } else {
-        throw std::invalid_argument("Invalid mtype_id. Valid options: 0: general, 1: symmetric, 2: hermitian, 3: spd, 4: hpd");
+    // Only initialize mtype/mview if this is the first instantiation (handle still null)
+    if (shared->handle == nullptr) {
+        // check on the type of matrix being solved
+        if (mtype_id == 0) {
+            shared->mtype = CUDSS_MTYPE_GENERAL;
+        } else if (mtype_id == 1) {
+            shared->mtype = CUDSS_MTYPE_SYMMETRIC;
+        } else if (mtype_id == 2) {
+            shared->mtype = CUDSS_MTYPE_HERMITIAN;
+        } else if (mtype_id == 3) {
+            shared->mtype = CUDSS_MTYPE_SPD;
+        } else if (mtype_id == 4) {
+            shared->mtype = CUDSS_MTYPE_HPD;
+        } else {
+            throw std::invalid_argument("Invalid mtype_id. Valid options: 0: general, 1: symmetric, 2: hermitian, 3: spd, 4: hpd");
+        }
+
+        // check on the view of the matrix provided
+        if (mview_id == 0) {
+            shared->mview = CUDSS_MVIEW_FULL;
+        } else if (mview_id == 1) {
+            shared->mview = CUDSS_MVIEW_UPPER;
+        } else if (mview_id == 2) {
+            shared->mview = CUDSS_MVIEW_LOWER;
+        } else {
+            throw std::invalid_argument("Invalid mview_id. Valid options: 0: full, 1: upper, 2: lower");
+        }
+
+        shared->nrhs = 1;
+
+        // CUDA setup can happen here before any cudaMallocs
+        cudaSetDevice(device_id);
     }
 
-    // check on the view of the matrix provided
-    if (mview_id == 0) {
-        // printf("full view provided\n");
-        state->mview = CUDSS_MVIEW_FULL;
-    } else if (mview_id == 1) {
-        // printf("upper view provided\n");
-        state->mview = CUDSS_MVIEW_UPPER;
-    } else if (mview_id == 2) {
-        // printf("lower view provided\n");
-        state->mview = CUDSS_MVIEW_LOWER;
-    } else {
-        throw std::invalid_argument("Invalid mview_id. Valid options: 0: full, 1: upper, 2: lower");
-    }
-
-    // Store uniform dimensions and batch size
-
-    state->nrhs = 1;
-
-    // CUDA setup can happen here before any cudaMallocs
-    cudaSetDevice(device_id);
-
-    // Allocate temporary storage for diagonal and permutation
-    size_t total_size = batch_size_64 * state->n;
-    cudaMalloc(&state->diag_temp, total_size * sizeof(typename get_native_data_type<T>::type));
-    cudaMalloc(&state->perm_temp, total_size * sizeof(int32_t));
-
-    return ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>>(std::move(state));
-    // return state; // simply return the created CudssBatchState
+    return ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>>(std::move(wrapper));
 }
 
 // execution ===================================================================
@@ -285,23 +310,37 @@ static void create_batched_csr_structure(
 template <ffi::DataType T>
 static ffi::Error CudssExecute(
     cudaStream_t stream,                    // JAXs stream given to this context (jit)
-    CudssBatchState<T>* state,                      // the state we instantiated in CudssInstantiate
+    CudssBatchState<T>* wrapper,            // the thin wrapper we instantiated in CudssInstantiate
     ffi::Buffer<T> b_values_buf,            // the real input data that varies per solution
     ffi::Buffer<T> csr_values_buf,          // the real input data that varies per solution
     ffi::Buffer<ffi::S32> offsets_buf,      // sparsity pattern row offsets
     ffi::Buffer<ffi::S32> columns_buf,      // sparsity pattern column indices
+    ffi::Buffer<ffi::S32> refactorize_signal,      // whether we should refactorize within jit
+    ffi::Buffer<ffi::S32> solve_signal,      // whether we should solve within jit
+    ffi::Buffer<ffi::S32> ir_nsteps_signal,  // number of iterative refinement steps
     ffi::ResultBuffer<T> out_values_buf,    // the output buffer we write the answer to
     ffi::ResultBuffer<T> diag_buf, // the output buffer for inertia [batch_size, 3]
     ffi::ResultBuffer<ffi::S32> perm_buf, // the output buffer for inertia [batch_size, 3]
+    const int64_t solver_id,                // unique id for shared state registry
     const int64_t batch_size_64,               // need to know without other structural data
     const int64_t device_id,                    // the device to run this on
     const int64_t mtype_id,                     // {0: gen, 1: sym, 2: herm, 3: spd, 4: hpd}
     const int64_t mview_id                      // {0: full, 1: triu, 2: tril}
 ) {
-    // printf("in execute \n");
-    // cudaStreamSynchronize(stream);
+
+    // Dereference shared state from the wrapper
+    auto* state = wrapper->shared.get();
+
+    // Synchronize with XLA stream to ensure signal buffers have been written
+    cudaStreamSynchronize(stream);
+
+    cudaMemcpy(&state->do_solve, solve_signal.typed_data(),
+                sizeof(int32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&state->ir_nsteps, ir_nsteps_signal.typed_data(),
+                sizeof(int32_t), cudaMemcpyDeviceToHost);
+
     if (state->call_count == 0) {
-        
+
         // figure this out on first call
         state->n = offsets_buf.element_count() - 1;
         state->nnz = columns_buf.element_count();
@@ -327,14 +366,14 @@ static ffi::Error CudssExecute(
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
         CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
         CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
-        
+
         // CuDSS structures creation
         int64_t batched_n = state->n * batch_size_64;
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, batched_n, state->nrhs, batched_n,
-            b_values_buf.typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
+            b_values_buf.typed_data(), state->cudss_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
 
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, batched_n, state->nrhs, batched_n,
-            out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
+            out_values_buf->typed_data(), state->cudss_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
 
         // Use singular matrix creation APIs
         int64_t batched_nnz = state->nnz * batch_size_64;
@@ -342,25 +381,24 @@ static ffi::Error CudssExecute(
             state->batched_offsets_ptr, NULL,
             state->batched_columns_ptr,
             csr_values_buf.typed_data(),
-            CUDA_R_32I, state->cuda_dtype,
+            CUDSS_R_32I, CUDSS_R_32I, state->cudss_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
 
-        // CuDSS config
-        // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = 5;
+        // CuDSS config - iterative refinement steps from runtime signal
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+                            &state->ir_nsteps, sizeof(state->ir_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         // cold solve - analyze, factorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE, 
-            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
-
+        if (state->do_solve) {
+            CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+                state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        }
         // so we dont init again...
         state->call_count++;
 
@@ -388,18 +426,32 @@ static ffi::Error CudssExecute(
         }
         // else: Pointers unchanged - batched structure is still valid, skip kernel!
 
-        // Update the values pointer which changes between calls
-        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->A, csr_values_buf.typed_data()), state->status, "update_pointers A");
+        // Read refactorize signal from GPU to host (cudaMemcpy is synchronous)
+        cudaMemcpy(&state->do_refactorize, refactorize_signal.typed_data(),
+                   sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+        // Update the values pointers which change between calls
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
 
-        // warm solve - refactorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION, 
-            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
+        // Always update A values pointer so IR uses correct matrix for residuals
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->A, csr_values_buf.typed_data()), state->status, "update_pointers A");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE, 
-            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        // Conditionally refactorize based on traced signal
+        if (state->do_refactorize) {
+            CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
+                state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
+        }
 
+        // Update IR steps from runtime signal before solve
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &state->ir_nsteps, sizeof(state->ir_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+
+        // Conditionally solve and iterative refine
+        if (state->do_solve) {
+            CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+                state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        }
     }
 
     cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
@@ -416,6 +468,7 @@ static ffi::Error CudssExecute(
 #define DEFINE_CUDSS_FFI_HANDLERS(TypeName, DataType) \
     XLA_FFI_DEFINE_HANDLER(kCudssInstantiate##TypeName, CudssInstantiate<DataType>, \
         ffi::Ffi::BindInstantiate() \
+            .Attr<int64_t>("solver_id") \
             .Attr<int64_t>("batch_size") \
             .Attr<int64_t>("device_id") \
             .Attr<int64_t>("mtype_id") \
@@ -429,10 +482,14 @@ static ffi::Error CudssExecute(
             .Arg<ffi::Buffer<DataType>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             /* Attributes must also be passed to execute */ \
+            .Attr<int64_t>("solver_id") \
             .Attr<int64_t>("batch_size") \
             .Attr<int64_t>("device_id") \
             .Attr<int64_t>("mtype_id") \
