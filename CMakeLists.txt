@@ -179,6 +179,14 @@ endif()
 
 enable_language(CUDA)
 
+# GPU architecture. CMake's default fallback is sm_75 (Turing), which emits a
+# SASS-only cubin that cannot load on newer GPUs (L40S = Ada = sm_89), so the
+# pseudo_batch_solve.cu kernel silently fails under vmap. A bare "89" (no
+# -real/-virtual suffix) emits BOTH sm_89 SASS and compute_89 PTX, giving a
+# native cubin plus a PTX fallback the driver can JIT for other archs.
+# FORCE overrides any stale value cached in the build dir's CMakeCache.txt.
+set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA arch (L40S = Ada = sm_89)" FORCE)
+
 
 # cuDSS FFI files
 
