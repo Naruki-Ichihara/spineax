@@ -17,7 +17,16 @@ foreach(_p IN LISTS CMAKE_PREFIX_PATH)
   message(STATUS "CMAKE_PREFIX_PATH entry: ${_p}")
   # Support both site-packages (pip/venv) and dist-packages (Debian/Ubuntu system Python)
   if(_p MATCHES "site-packages" OR _p MATCHES "dist-packages")
-    set(_site_prefix "${_p}")
+    # Under pip build isolation the ephemeral /tmp/pip-build-env-*/overlay
+    # site-packages also appears in CMAKE_PREFIX_PATH but contains no nvidia
+    # packages — only accept a prefix that actually has nvidia/ in it, and
+    # otherwise keep the first plain match as a fallback for the error message.
+    if(EXISTS "${_p}/nvidia")
+      set(_site_prefix "${_p}")
+      break()
+    elseif(NOT _site_prefix)
+      set(_site_prefix "${_p}")
+    endif()
   endif()
 endforeach()
 
@@ -146,7 +155,20 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
+# Build device code for the GPU(s) present on the build machine by default.
+# Must be set BEFORE enable_language(CUDA): that call otherwise caches nvcc's
+# default arch (sm_75) and ships only PTX for newer GPUs (e.g. Blackwell sm_120).
+# The driver then has to JIT that PTX at kernel launch, and if the toolkit's PTX
+# ISA is newer than the installed driver supports it fails at runtime with
+# cudaErrorUnsupportedPtxVersion. Emitting a native cubin for the real arch
+# avoids the JIT entirely.
+# Override with -DCMAKE_CUDA_ARCHITECTURES=120 (or a list) when cross-building.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 enable_language(CUDA)
+message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 # Option to disable pbatch_solve (useful when nvcc version doesn't match CUDA runtime)
 option(BUILD_PBATCH_SOLVE "Build pseudo batch solve module (requires matching nvcc)" ON)
@@ -205,9 +227,13 @@ foreach(TARGET ${SPINEAX_TARGETS})
   # Add RPATH so the .so can find its dependencies
   # Use $ORIGIN to make paths relative to the installed module location
   # Modules install to site-packages/spineax/, CUDA libs are in site-packages/nvidia/*/lib/
+  # INSTALL_RPATH: the portable $ORIGIN entries resolve in a real site-packages
+  # install (spineax/ and nvidia/ are siblings). Editable installs load the .so
+  # from the build tree where no sibling nvidia/ exists, so the absolute env lib
+  # dirs are appended as a fallback (ignored where they don't exist).
   set_target_properties(${TARGET} PROPERTIES
     BUILD_RPATH "${ENV_NVIDIA_BUILD_RPATH}"
-    INSTALL_RPATH "${ENV_NVIDIA_INSTALL_RPATH}"
+    INSTALL_RPATH "${ENV_NVIDIA_INSTALL_RPATH}:${ENV_NVIDIA_BUILD_RPATH}"
     INSTALL_RPATH_USE_LINK_PATH FALSE
   )
 endforeach()
