@@ -1,7 +1,9 @@
 [build-system]
 requires = [
-    "scikit-build-core >= 0.5",
-    "nanobind",
+    "scikit-build-core >= 0.5", 
+    "nanobind", 
+    "jax[cuda12]>=0.5.0",
+    "nvidia-cudss-cu12"
 ]
 build-backend = "scikit_build_core.build"
 
@@ -13,19 +15,13 @@ authors = [
     {name = "John Viljoen"}
 ]
 dependencies = [
+    "jax[cuda12]>=0.5.0", # gives us XLA, CUDART, nvcc...
+    "nvidia-cudss-cu12", # cudss is in pip!!! how helpful
     "jaxtyping",
     "equinox",
 ]
 
 [project.optional-dependencies]
-cuda12 = [
-    "jax[cuda12]>=0.5.0",
-    "nvidia-cudss-cu12",
-]
-cuda13 = [
-    "jax[cuda13]>=0.8.0",
-    "nvidia-cudss-cu13",
-]
 dev = [
     "nanobind",
     "ninja",
@@ -43,7 +39,7 @@ include = ["src/spineax/**", "CMakeLists.txt", "src/**/*.cpp", "src/**/*.cu"]
 [tool.scikit-build]
 minimum-version = "0.5"
 build-dir = "build/{wheel_tag}"
-editable.rebuild = true
+editable.rebuild = true # in an editable install rebuild upon changes
 
 [tool.setuptools.packages.find]
 where = [
