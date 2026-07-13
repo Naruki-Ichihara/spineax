@@ -106,6 +106,8 @@ struct CudssSharedState {
     cudssIndexBase_t base = CUDSS_BASE_ZERO;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
     cudaStream_t last_stream = nullptr; // track stream for synchronization
+    typename get_native_data_type<T>::type* diag_temp = nullptr; // temporary storage for diagonal values
+    int32_t* perm_temp = nullptr; // temporary storage for permutation
     int64_t n = 0;
     int64_t nnz = 0;
     int64_t nrhs = 0;
@@ -132,6 +134,8 @@ struct CudssSharedState {
             cudssConfigDestroy(config);
             cudssDestroy(handle);
         }
+        if (diag_temp) cudaFree(diag_temp);
+        if (perm_temp) cudaFree(perm_temp);
     }
 };
 

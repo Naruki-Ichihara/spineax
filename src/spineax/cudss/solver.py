@@ -792,7 +792,7 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
             kwargs_copy = dict(kwargs)
             kwargs_copy.pop("batch_size", None)
             x_flat, inertia_flat = solver.bind(
-                b_flat, csr_flat, csr_offsets, csr_columns,
+                b_flat, csr_flat, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal,
                 batch_size=total_batch,
                 **kwargs_copy
             )
@@ -872,9 +872,15 @@ class CuDSSSolver(eqx.Module):
         self.mtype_id = mtype_id
         self.mview_id = mview_id
 
-    def __call__(self, b, csr_values, refactorize_signal, solve_signal, ir_nsteps_signal=None):
+    def __call__(self, b, csr_values, refactorize_signal=None, solve_signal=None, ir_nsteps_signal=None):
+        # Defaults reproduce the pre-signal behavior: every call refactorizes and
+        # solves, with no iterative refinement (IR corrupts LDL solves).
+        if refactorize_signal is None:
+            refactorize_signal = jnp.array([1], dtype=jnp.int32)
+        if solve_signal is None:
+            solve_signal = jnp.array([1], dtype=jnp.int32)
         if ir_nsteps_signal is None:
-            ir_nsteps_signal = jnp.array([5], dtype=jnp.int32)
+            ir_nsteps_signal = jnp.array([0], dtype=jnp.int32)
         return solve(b, csr_values,
             csr_offsets=self.csr_offsets,
             csr_columns=self.csr_columns,
