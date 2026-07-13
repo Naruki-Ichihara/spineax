@@ -5,14 +5,16 @@ Strategy: factorize once, solve twice (with and without IR), then
 per-element select whichever has the smaller residual norm.
 
 This avoids IR divergence on badly-conditioned indefinite systems
-while still benefiting from IR on well-conditioned ones.
+while still benefiting from IR on well-conditioned ones. With the
+token API, IR is a plain per-call argument to solve() — the two
+solves share ONE block-diagonal factorization.
 """
 
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss.solver import CuDSSSolver
+from spineax.cudss import tokens as tk
 
 
 def make_kkt_batch(n_x=100, n_c=40, batch_size=8, seed=0):
@@ -65,7 +67,7 @@ def make_kkt_batch(n_x=100, n_c=40, batch_size=8, seed=0):
         rhs = jax.random.normal(k3, (n,), dtype=jnp.float64)
         x_true = jnp.linalg.solve(K, rhs)
 
-        # Upper triangle CSR (for cuDSS solver)
+        # Upper triangle CSR (for cuDSS)
         K_upper = jnp.triu(K)
         LHS_upper = jsparse.BCSR.fromdense(K_upper)
 
@@ -114,25 +116,20 @@ def test_safe_ir():
 
     n = full_offsets.shape[0] - 1  # matrix dimension
 
-    solver = CuDSSSolver(upper_offsets, upper_columns, device_id=0, mtype_id=1, mview_id=1)
-
-    zero = jnp.array([0], dtype=jnp.int32)
-    one = jnp.array([1], dtype=jnp.int32)
-    ir0 = jnp.array([0], dtype=jnp.int32)
-    ir_n = jnp.array([20], dtype=jnp.int32)
-
-    vmap_solver = jax.vmap(solver, in_axes=(0, 0, None, None, None))
+    # ONE block-diagonal entry for the whole batch (explicit batch door)
+    token = tk.analyze(upper_vals_batch, upper_offsets, upper_columns,
+                       mtype_id=1, mview_id=1)
 
     @jax.jit
-    def safe_ir_solve(b_batch, upper_vals_batch, full_vals_batch):
+    def safe_ir_solve(token, b_batch, upper_vals_batch, full_vals_batch):
         # 1. Factorize only (no solve)
-        vmap_solver(b_batch, upper_vals_batch, one, zero, ir0)
+        token = tk.factorize(token, upper_vals_batch)
 
         # 2. Solve without IR
-        x0, inertia = vmap_solver(b_batch, upper_vals_batch, zero, one, ir0)
+        x0 = tk.solve(token, b_batch, ir_nsteps=0)
 
-        # 3. Solve with IR=20 (reuses same factorization)
-        x_ir, _ = vmap_solver(b_batch, upper_vals_batch, zero, one, ir_n)
+        # 3. Solve with IR=20 (reuses the same factorization)
+        x_ir = tk.solve(token, b_batch, ir_nsteps=20)
 
         # 4. Per-element residual norms via sparse matvec (no dense materialization)
         resid_fn = lambda vals, x, b: sparse_residual_norm(vals, full_offsets, full_columns, n, x, b)
@@ -143,26 +140,28 @@ def test_safe_ir():
         use_ir = resid_ir < resid_0  # shape [batch_size]
         x_best = jnp.where(use_ir[:, None], x_ir, x0)
 
-        return x0, x_ir, x_best, inertia, resid_0, resid_ir, use_ir
+        return x0, x_ir, x_best, token, resid_0, resid_ir, use_ir
 
-    x0, x_ir, x_best, inertia, resid_0, resid_ir, use_ir = \
-        safe_ir_solve(b_batch, upper_vals_batch, full_vals_batch)
+    x0, x_ir, x_best, token, resid_0, resid_ir, use_ir = \
+        safe_ir_solve(token, b_batch, upper_vals_batch, full_vals_batch)
+
+    # Per-block inertia from the one data door
+    inertia = tk.inertia(tk.query(token), batch_size=batch_size)
 
     # Report per-element results
-    print(f"\n  {'elem':>4}  {'type':>6}  {'cond(K)':>10}  {'err(ir=0)':>10}  {'err(ir=20)':>11}  "
-          f"{'err(best)':>10}  {'resid(0)':>10}  {'resid(20)':>11}  {'chose':>6}")
-    print(f"  {'-'*4}  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*11}  {'-'*10}  {'-'*10}  {'-'*11}  {'-'*6}")
+    print(f"\n  {'elem':>4}  {'type':>6}  {'cond(K)':>10}  {'inertia':>10}  {'err(ir=0)':>10}  "
+          f"{'err(ir=20)':>11}  {'err(best)':>10}  {'chose':>6}")
+    print(f"  {'-'*4}  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*11}  {'-'*10}  {'-'*6}")
 
     for i in range(batch_size):
         err_0 = float(jnp.linalg.norm(x0[i] - x_true_batch[i]) / jnp.linalg.norm(x_true_batch[i]))
         err_ir = float(jnp.linalg.norm(x_ir[i] - x_true_batch[i]) / jnp.linalg.norm(x_true_batch[i]))
         err_best = float(jnp.linalg.norm(x_best[i] - x_true_batch[i]) / jnp.linalg.norm(x_true_batch[i]))
-        r0 = float(resid_0[i])
-        r_ir = float(resid_ir[i])
         chose = "ir=20" if bool(use_ir[i]) else "ir=0"
+        inr = f"({int(inertia[i, 0])},{int(inertia[i, 1])})"
 
-        print(f"  {i:>4}  {labels[i]:>6}  {conds[i]:>10.2e}  {err_0:>10.2e}  {err_ir:>11.2e}  "
-              f"{err_best:>10.2e}  {r0:>10.2e}  {r_ir:>11.2e}  {chose:>6}")
+        print(f"  {i:>4}  {labels[i]:>6}  {conds[i]:>10.2e}  {inr:>10}  {err_0:>10.2e}  "
+              f"{err_ir:>11.2e}  {err_best:>10.2e}  {chose:>6}")
 
     # Summary
     n_ir = int(use_ir.sum())

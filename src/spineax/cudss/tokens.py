@@ -85,15 +85,19 @@ def _suffix(dtype) -> str:
         ) from None
 
 
-def compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim):
+def compute_inertia_from_diag(diag, batch_size, matrix_dim):
     """Per-block [positive, negative] counts from the LDL^T diagonal.
 
-    ``diag`` is in factor order; ``perm`` maps it back to the original
-    (block-grouped) row order, so the reshape splits cleanly per block.
+    cuDSS >= 0.8 returns CUDSS_DATA_DIAG **in input order** ("the original
+    matrix order, taking into account all permutations" — cuDSS docs; changed
+    in the 0.8 release notes from the internal order of <= 0.7). Input order
+    is block-grouped, so the reshape splits cleanly per block and NO
+    permutation may be applied. The legacy ``diag[argsort(perm)]`` reorder
+    was correct for cuDSS <= 0.7 and silently misattributes blocks in
+    heterogeneous batches on 0.8 (found via the newton_ipm_loop example;
+    verified against the docs with a distinct-diagonal experiment).
     """
-    inv_perm = jnp.argsort(perm)
-    diag_original_order = diag[inv_perm]
-    out = diag_original_order.reshape([batch_size, matrix_dim])
+    out = diag.reshape([batch_size, matrix_dim])
 
     # cuDSS pivoting threshold seems to be 1e-13. everything above this on
     # plus or minus side seems to reliably indicate that particular inertia value.
@@ -468,8 +472,7 @@ def inertia(data: dict, batch_size: int = 1):
     diag = data["diag"]
     diag_real = diag.real if jnp.iscomplexobj(diag) else diag
     n = diag.shape[0] // batch_size
-    result = compute_inertia_from_diag_perm(
-        diag_real, data["perm_reorder_row"], batch_size, n)
+    result = compute_inertia_from_diag(diag_real, batch_size, n)
     return result if batch_size > 1 else result[0]
 
 

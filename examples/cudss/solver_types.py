@@ -1,10 +1,10 @@
-import jax
+"""Example: all five cuDSS matrix types through the token API."""
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss.solver import CuDSSSolver
+from spineax.cudss import tokens as tk
 
 
-def test_datatypes(mtype_id):
+def test_solver_types(mtype_id):
 
     # example usage
     # -------------
@@ -24,17 +24,15 @@ def test_datatypes(mtype_id):
     LHS1 = jsparse.BCSR.fromdense(m1)
     csr_offsets1, csr_columns1, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
 
-    device_id = 0 # run on GPU 0
-    mview_id = 0 # we are passing the whole LHS matrix in FULL
-
-    # instantiate solve
-    solver = CuDSSSolver(csr_offsets1, csr_columns1, device_id, mtype_id, mview_id)
-
-    x, inertia = solver(b1, csr_values1)
+    # we are passing the whole LHS matrix in FULL (mview_id=0), on GPU 0
+    token = tk.analyze(csr_values1, csr_offsets1, csr_columns1,
+                       mtype_id=mtype_id, mview_id=0, device_id=0)
+    token = tk.factorize(token, csr_values1)
+    x = tk.solve(token, b1)
 
     # check out the values of the various things!
     print(f"x: {x}")
-    print(f"inertia: {inertia}")
+    print(f"max err vs dense solve: {jnp.max(jnp.abs(x - true_x1)):.2e}")
 
 mtypes = [
     "general",
@@ -46,4 +44,4 @@ mtypes = [
 
 for mtype_id, mtype in enumerate(mtypes):
     print(f"testing: {mtype}")
-    test_datatypes(mtype_id)
+    test_solver_types(mtype_id)

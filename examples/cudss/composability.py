@@ -1,7 +1,14 @@
+"""Example: the token API composes with jit and vmap.
+
+A batch under vmap is ONE block-diagonal cuDSS system: vmap(analyze) mints a
+single registry entry and every downstream phase is one batched call.
+(Nested vmap is not supported — flatten nested batches into one batch axis.)
+"""
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss.solver import CuDSSSolver
+from spineax.cudss import tokens as tk
+
 
 def test_composability():
 
@@ -23,36 +30,31 @@ def test_composability():
     true_x2 = jnp.linalg.solve(m2, b2)
 
     LHS1 = jsparse.BCSR.fromdense(M1)
-    LHS2 = jsparse.BCSR.fromdense(M2)
-    csr_offsets1, csr_columns1, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
-    csr_offsets2, csr_columns2, csr_values2 = LHS2.indptr, LHS2.indices, LHS2.data
+    csr_offsets, csr_columns, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
+    csr_values2 = jsparse.BCSR.fromdense(M2).data
 
-    assert all(csr_offsets1 == csr_offsets2)
-    assert all(csr_columns1 == csr_columns2)
-
-    offsets_batch = jnp.vstack([csr_offsets1, csr_offsets2])
-    columns_batch = jnp.vstack([csr_columns1, csr_columns2])
     csr_values = jnp.vstack([csr_values1, csr_values2])
-    device_id = 0; mtype_id = 1; mview_id = 1
     b = jnp.vstack([b1, b2])
 
-    # instantiate solve
-    solver = CuDSSSolver(csr_offsets1, csr_columns1, device_id, mtype_id, mview_id)
+    def token_solve(values, b):
+        token = tk.analyze(values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+        token = tk.factorize(token, values)
+        return tk.solve(token, b)
 
-    # call it - dispatches single solve by default
-    test1, in1 = solver(b[0], csr_values[0])
+    # single solve, eager
+    x1 = token_solve(csr_values[0], b[0])
 
-    # call it in vmap/jit
-    test2, in2 = jax.jit(jax.vmap(solver))(b, csr_values)
-
-    # unlimited composability in jit/vmap
-    b_ = jnp.stack([jnp.stack([b,b]), jnp.stack([b,b])])
-    csr_values_ = jnp.stack([jnp.stack([csr_values, csr_values]), jnp.stack([csr_values, csr_values])])
-    test3, in3 = jax.jit(jax.vmap(jax.vmap(jax.vmap(solver))))(b_, csr_values_)
+    # jit + vmap: one block-diagonal factorization + one block solve
+    x = jax.jit(jax.vmap(token_solve))(csr_values, b)
 
     # see difference between dense solves and cuDSS
-    print(f"difference between cudss and cusolver in single solve: {jnp.linalg.norm(test1 - true_x1)}")
+    print(f"difference between cudss and cusolver in single solve: {jnp.linalg.norm(x1 - true_x1)}")
+    print(f"difference between cudss and cusolver in vmap solve: {jnp.linalg.norm(x - jnp.stack([true_x1, true_x2]))}")
 
-    print(f"difference between cudss and cusolver in vmap solve: {jnp.linalg.norm(test2 - jnp.stack([true_x1, true_x2]))}")
+    assert jnp.allclose(x1, true_x1, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(x, jnp.stack([true_x1, true_x2]), rtol=1e-5, atol=1e-5)
 
-test_composability()
+
+if __name__ == "__main__":
+    test_composability()
+    print("composability example completed.")

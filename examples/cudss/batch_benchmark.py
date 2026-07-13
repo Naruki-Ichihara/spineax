@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # ensure we use GPU 0 for this benchmark
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4")
 import time
 import numpy as np
 import jax
@@ -8,7 +8,7 @@ jax.devices()  # force CUDA init before spineax import
 
 import jax.numpy as jnp
 import scipy.sparse as sp
-from spineax.cudss.solver import CuDSSSolver
+from spineax.cudss import tokens as tk
 
 # Load the linear system (COO format)
 data = np.load('/home/john/code/jax_ssids/systems/quad_kkt_systems/iter_1.npz')
@@ -31,42 +31,57 @@ b = jnp.array(rhs, dtype=jnp.float64)
 
 print(f"Matrix size: {n}x{n}, nnz: {csr.nnz}")
 
-# Create solver - symmetric matrix, upper triangular view (KKT system)
-solver = CuDSSSolver(csr_offsets, csr_columns, device_id=0, mtype_id=1, mview_id=1)
-
-# Single solve to verify correctness
-x, inertia = solver(b, csr_values)
+# Single solve to verify correctness - symmetric, upper triangular view (KKT)
+token = tk.analyze(csr_values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+token = tk.factorize(token, csr_values)
+x = tk.solve(token, b)
 residual = jnp.linalg.norm(jnp.array(csr.toarray()) @ x - b)
 print(f"Single solve residual: {residual:.2e}")
-print(f"Inertia: {inertia}")
+print(f"Inertia: {tk.inertia(tk.query(token))}")
+tk.release(token)
 
-# Batch of 2000 - tile the same system
+# Batch - tile the same system into ONE block-diagonal factorization
+# (explicit batch door: (B, nnz) values, shared pattern)
 batch_size = 2000
 b_batch = jnp.tile(b[None, :], (batch_size, 1))
 csr_values_batch = jnp.tile(csr_values[None, :], (batch_size, 1))
 
-# Warm up jit+vmap (includes first factorization)
-batched_solver = jax.jit(jax.vmap(solver))
-x_batch, inertia_batch = batched_solver(b_batch, csr_values_batch)
+refact_j = jax.jit(tk.refactorize)
+solve_j = jax.jit(tk.solve)
+
+# Warm up (includes block analysis + first factorization)
+btoken = tk.analyze(csr_values_batch, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+btoken = tk.factorize(btoken, csr_values_batch)
+x_batch = solve_j(btoken, b_batch)
 jax.block_until_ready(x_batch)
 print(f"\nBatch solve output shape: {x_batch.shape}")
 
-# Time it
+# Time the full IPM-style iteration (refactorize + solve) and solve-only
 num_runs = 10
 times = []
 for i in range(num_runs):
     start = time.perf_counter()
-    x_batch, inertia_batch = batched_solver(b_batch, csr_values_batch)
+    btoken = refact_j(btoken, csr_values_batch)
+    x_batch = solve_j(btoken, b_batch)
     jax.block_until_ready(x_batch)
-    elapsed = time.perf_counter() - start
-    times.append(elapsed)
+    times.append(time.perf_counter() - start)
+
+times_solve = []
+for i in range(num_runs):
+    start = time.perf_counter()
+    x_batch = solve_j(btoken, b_batch)
+    jax.block_until_ready(x_batch)
+    times_solve.append(time.perf_counter() - start)
 
 print(f"\nBatch size: {batch_size}")
-print(f"Timing over {num_runs} runs:")
+print(f"refactorize+solve over {num_runs} runs:")
 print(f"  Mean:      {np.mean(times)*1000:.2f} ms")
 print(f"  Min:       {np.min(times)*1000:.2f} ms")
 print(f"  Max:       {np.max(times)*1000:.2f} ms")
 print(f"  Per solve: {np.mean(times)/batch_size*1e6:.2f} us")
+print(f"solve-only over {num_runs} runs:")
+print(f"  Mean:      {np.mean(times_solve)*1000:.2f} ms")
+print(f"  Per solve: {np.mean(times_solve)/batch_size*1e6:.2f} us")
 
 # =============================================================================
 # SPD benchmark (Cholesky) - same sparsity pattern, diagonally dominant values
@@ -108,19 +123,19 @@ for i in range(n):
 
 csr_values_spd = jnp.array(spd_data, dtype=jnp.float64)
 
-# SPD solver (mtype_id=3), same upper triangular view
-solver_spd = CuDSSSolver(csr_offsets, csr_columns, device_id=0, mtype_id=3, mview_id=1)
-
-# Single solve to verify
-x_spd, inertia_spd = solver_spd(b, csr_values_spd)
-print(f"Single solve inertia: {inertia_spd}")
+# SPD (mtype_id=3), same upper triangular view - single solve to verify
+token_spd = tk.analyze(csr_values_spd, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
+token_spd = tk.factorize(token_spd, csr_values_spd)
+print(f"Single solve inertia: {tk.inertia(tk.query(token_spd))}")
+tk.release(token_spd)
 
 # Batch
 csr_values_spd_batch = jnp.tile(csr_values_spd[None, :], (batch_size, 1))
 
 # Warm up
-batched_solver_spd = jax.jit(jax.vmap(solver_spd))
-x_batch_spd, _ = batched_solver_spd(b_batch, csr_values_spd_batch)
+btoken_spd = tk.analyze(csr_values_spd_batch, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
+btoken_spd = tk.factorize(btoken_spd, csr_values_spd_batch)
+x_batch_spd = solve_j(btoken_spd, b_batch)
 jax.block_until_ready(x_batch_spd)
 print(f"Batch solve output shape: {x_batch_spd.shape}")
 
@@ -128,13 +143,13 @@ print(f"Batch solve output shape: {x_batch_spd.shape}")
 times_spd = []
 for i in range(num_runs):
     start = time.perf_counter()
-    x_batch_spd, _ = batched_solver_spd(b_batch, csr_values_spd_batch)
+    btoken_spd = refact_j(btoken_spd, csr_values_spd_batch)
+    x_batch_spd = solve_j(btoken_spd, b_batch)
     jax.block_until_ready(x_batch_spd)
-    elapsed = time.perf_counter() - start
-    times_spd.append(elapsed)
+    times_spd.append(time.perf_counter() - start)
 
 print(f"\nBatch size: {batch_size}")
-print(f"Timing over {num_runs} runs:")
+print(f"refactorize+solve over {num_runs} runs:")
 print(f"  Mean:      {np.mean(times_spd)*1000:.2f} ms")
 print(f"  Min:       {np.min(times_spd)*1000:.2f} ms")
 print(f"  Max:       {np.max(times_spd)*1000:.2f} ms")
@@ -155,16 +170,18 @@ print("\n" + "="*60)
 print("Cholesky on indefinite matrix - expect failure")
 print("="*60)
 
-solver_spd_indef = CuDSSSolver(csr_offsets, csr_columns, device_id=0, mtype_id=3, mview_id=1)
 try:
-    x_fail, inertia_fail = solver_spd_indef(b, csr_values)
+    token_fail = tk.analyze(csr_values, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
+    token_fail = tk.factorize(token_fail, csr_values)
+    x_fail = tk.solve(token_fail, b)
     jax.block_until_ready(x_fail)
     # Check if cuDSS silently produced garbage (non-zero negative inertia means indefinite)
-    inertia_fail = np.array(inertia_fail)
+    inertia_fail = np.array(tk.inertia(tk.query(token_fail)))
     if inertia_fail[1] > 0:
         print(f"PASS: cuDSS detected indefiniteness via inertia: {inertia_fail}")
     else:
-        residual_fail = jnp.linalg.norm(jnp.array(csr.toarray() + csr.toarray().T - np.diag(csr.toarray().diagonal())) @ x_fail - b)
+        A_full = csr.toarray() + csr.toarray().T - np.diag(csr.toarray().diagonal())
+        residual_fail = jnp.linalg.norm(jnp.array(A_full) @ x_fail - b)
         print(f"WARNING: Cholesky did not raise, residual: {residual_fail:.2e}, inertia: {inertia_fail}")
 except Exception as e:
     print(f"PASS: Cholesky correctly failed on indefinite matrix: {type(e).__name__}: {e}")

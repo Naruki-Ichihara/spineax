@@ -320,6 +320,39 @@ def test_inertia_indefinite():
     np.testing.assert_array_equal(np.asarray(inertia), expected)
 
 
+def test_inertia_heterogeneous_batch_attribution():
+    """Per-block inertia must land on the RIGHT blocks.
+
+    Regression test: sign counts are computed on the block-aligned diag
+    directly; reordering by perm_reorder_row first misattributes blocks in
+    heterogeneous batches (its cross-block structure does not match the diag
+    layout). Homogeneous batches cannot catch this — every block looks alike.
+    """
+    _require_gpu()
+    n = 40
+    rng = np.random.default_rng(30)
+    # distinct expected inertia per block: PD, indefinite, PD, indefinite
+    blocks, expected = [], []
+    for i in range(4):
+        A = rng.standard_normal((n, n))
+        A = A + A.T + (n if i % 2 == 0 else 0.0) * np.eye(n)
+        eigs = np.linalg.eigvalsh(A)
+        expected.append([int((eigs > 0).sum()), int((eigs < 0).sum())])
+        blocks.append(A)
+    assert expected[0] != expected[1]  # the test is vacuous otherwise
+
+    mask = np.triu(np.ones((n, n), dtype=bool))
+    columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
+    offsets = jnp.asarray(
+        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
+    vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks]))
+
+    token = tk.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
+    token = tk.factorize(token, vals)
+    inertia = tk.inertia(tk.query(token), batch_size=4)
+    np.testing.assert_array_equal(np.asarray(inertia), expected)
+
+
 # error handling ===============================================================
 def test_solve_before_factorize_raises():
     _require_gpu()
@@ -381,7 +414,7 @@ def _csr_of(M):
 
 def test_legacy_composability():
     _require_gpu()
-    M1, b1, m1, true_x1 = _legacy_base_system(jnp.float32)
+    M1, b1, _, true_x1 = _legacy_base_system(jnp.float32)
     M2 = M1 * 0.9
     b2 = b1 * 1.1
     m2 = M2 + M2.T - jnp.diag(M2) * jnp.eye(M2.shape[0], dtype=M2.dtype)
