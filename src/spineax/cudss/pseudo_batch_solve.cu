@@ -1,16 +1,15 @@
 /*
-This is a different method for solving batch systems with cuDSS without actually
-using cuDSS's batch API. This is done as it allows us to retrieve some data which
-is not currently made available when using the batch API. Therefore in subsequent
-releases of cuDSS this file will become redundant and we should only use 
-- single_solve.cpp
-- batch_solve.cpp
-- ragged_solve.cpp
+spineax's cuDSS backend: token-based persistent factorization
+(docs/token_design.md).
 
-But for now (cuDSS version 0.6.0), this allows us to get batch inertias out before
-they officially support it
+Batch systems are solved WITHOUT cuDSS's batch API: a batch of B systems is
+its block-diagonal concatenation, one bigger sparse system. This exposes data
+(per-block inertia via diag/perm) the batch API does not, and makes a single
+solve just the batch_size=1 special case — so this one module is the whole
+backend.
 
-(I previously made this file .cu just so cmakelists sees that it needs nvcc for the summation kernel)
+(This file is .cu so cmake sees it needs nvcc for the block-structure
+expansion kernels.)
 */
 
 #include <cstdint>
@@ -27,60 +26,13 @@ they officially support it
 #include <mutex>
 #include <map>
 #include <unordered_map>
+#include <atomic>
+#include <cstdlib>
+#include <list>
+#include <string>
 
 namespace ffi = xla::ffi;
 namespace nb = nanobind;
-
-// verification ================================================================
-#define CUDSS_CALL_AND_CHECK(call, status, msg) \
-    do { \
-        status = call; \
-        if (status != CUDSS_STATUS_SUCCESS) { \
-            printf("FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
-            return ffi::Error::Success(); \
-        } \
-    } while(0);
-
-// debugging ===================================================================
-template <typename T>
-void print_device_data(
-    const char* label,
-    void* device_ptr,
-    size_t n_batch,
-    size_t n_elements_per_batch)
-{
-    // Ensure we have a valid pointer and something to print
-    if (!device_ptr || n_batch == 0 || n_elements_per_batch == 0) return;
-
-    std::cout << "\n--- Debug Print: " << label << " ---" << std::endl;
-
-    // Calculate total size and create a host-side vector
-    size_t total_elements = n_batch * n_elements_per_batch;
-    std::vector<T> host_data(total_elements);
-
-    // Copy all data from GPU to CPU in one go
-    cudaMemcpy(
-        host_data.data(),
-        device_ptr,
-        total_elements * sizeof(T),
-        cudaMemcpyDeviceToHost
-    );
-
-    // Loop through each batch and print its contents
-    for (size_t i = 0; i < n_batch; ++i) {
-        std::cout << "Batch " << i << ": [";
-        size_t batch_start_index = i * n_elements_per_batch;
-        for (size_t j = 0; j < n_elements_per_batch; ++j) {
-            std::cout << host_data[batch_start_index + j];
-            if (j < n_elements_per_batch - 1) {
-                std::cout << ", ";
-            }
-        }
-        std::cout << "]" << std::endl;
-    }
-    std::cout << "------------------------------------" << std::endl;
-}
-
 
 // Helper function for data types ==============================================
 template <ffi::DataType T> cudssDataType_t get_cudss_data_type();
@@ -95,148 +47,6 @@ template<> struct get_native_data_type<ffi::F32> { using type = float; };
 template<> struct get_native_data_type<ffi::F64> { using type = double; };
 template<> struct get_native_data_type<ffi::C64> { using type = std::complex<float>; };
 template<> struct get_native_data_type<ffi::C128> { using type = std::complex<double>; };
-
-// Structure definitions =======================================================
-template <ffi::DataType T>
-struct CudssBatchSharedState {
-    cudssHandle_t handle = nullptr;
-    cudssConfig_t config = nullptr;
-    cudssData_t data = nullptr;
-    cudssMatrix_t A = nullptr;
-    cudssMatrix_t x = nullptr;
-    cudssMatrix_t b = nullptr;
-    cudssMatrixType_t mtype = CUDSS_MTYPE_SYMMETRIC;
-    cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
-    cudssIndexBase_t base = CUDSS_BASE_ZERO;
-    cudssStatus_t status = CUDSS_STATUS_SUCCESS;
-    int32_t* batched_offsets_ptr = nullptr; // the pseudo batch must form these manually in C++
-    int32_t* batched_columns_ptr = nullptr; // the pseudo batch must form these manually in C++
-    int64_t n;
-    int64_t nnz;
-    int64_t nrhs;
-    int64_t call_count = 0; // necessary for detecting if we need further instantiation in execution stage
-    size_t sizeWritten;
-    int32_t do_refactorize; // host-side flag read from traced GPU signal
-    int32_t do_solve; // host-side flag read from traced GPU signal
-    int32_t ir_nsteps; // host-side value read from traced GPU signal
-    cudssDataType_t cudss_dtype = get_cudss_data_type<T>();
-
-    // Cache pointer addresses to detect if sparsity pattern has changed
-    int32_t* cached_offsets_ptr = nullptr;
-    int32_t* cached_columns_ptr = nullptr;
-
-    // this is literally only for debugging
-    using native_dtype = typename get_native_data_type<T>::type;
-
-    ~CudssBatchSharedState() {
-        // TODO: Fix destructor - currently causes double free on CUDA 13 / cuDSS 0.7
-        // The issue is likely related to cudaMallocAsync/cudaFree mismatch or
-        // destruction order of cuDSS objects that reference batched_*_ptr memory.
-        // For now, we leak memory to avoid the crash.
-
-        // cudaDeviceSynchronize();
-        //
-        // if (handle) {
-        //     cudssMatrixDestroy(A);
-        //     cudssMatrixDestroy(b);
-        //     cudssMatrixDestroy(x);
-        //     cudssDataDestroy(handle, data);
-        //     cudssConfigDestroy(config);
-        //     cudssDestroy(handle);
-        // }
-        // if (batched_offsets_ptr) cudaFree(batched_offsets_ptr);
-        // if (batched_columns_ptr) cudaFree(batched_columns_ptr);
-    }
-};
-
-// Thin wrapper that XLA FFI State<T> manages; points to shared state via registry
-template <ffi::DataType T>
-struct CudssBatchState {
-    static xla::ffi::TypeId id;
-    std::shared_ptr<CudssBatchSharedState<T>> shared;
-};
-
-template <> ffi::TypeId CudssBatchState<ffi::F32>::id = {};
-template <> ffi::TypeId CudssBatchState<ffi::F64>::id = {};
-template <> ffi::TypeId CudssBatchState<ffi::C64>::id = {};
-template <> ffi::TypeId CudssBatchState<ffi::C128>::id = {};
-
-// Global registry: all custom_calls from the same Python CuDSSSolver share one CudssBatchSharedState.
-// Keyed by (solver_id, batch_size): the batched CSR structures and dense matrices are
-// sized for a specific batch size, so executables with different batch sizes (e.g.
-// nested vmap flattening) must NOT share cuDSS state — reusing a smaller batch's
-// structures leaves the tail of the output buffer unsolved.
-template <ffi::DataType T>
-struct CudssBatchRegistry {
-    static std::mutex mtx;
-    static std::map<std::pair<int64_t, int64_t>, std::shared_ptr<CudssBatchSharedState<T>>> states;
-    static std::shared_ptr<CudssBatchSharedState<T>> get_or_create(int64_t solver_id, int64_t batch_size) {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto key = std::make_pair(solver_id, batch_size);
-        auto it = states.find(key);
-        if (it != states.end()) return it->second;
-        auto s = std::make_shared<CudssBatchSharedState<T>>();
-        states[key] = s;
-        return s;
-    }
-};
-template <ffi::DataType T> std::mutex CudssBatchRegistry<T>::mtx;
-template <ffi::DataType T> std::map<std::pair<int64_t, int64_t>, std::shared_ptr<CudssBatchSharedState<T>>> CudssBatchRegistry<T>::states;
-
-// instantiate =================================================================
-// create everything that is not a function of the context (cudaStream_t)
-template <ffi::DataType T>
-static ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>> CudssInstantiate(
-    const int64_t solver_id,                // unique id for shared state registry
-    const int64_t batch_size_64,               // need to know without other structural data
-    const int64_t device_id,                // the device to run this on
-    const int64_t mtype_id,                 // {0: gen, 1: sym, 2: herm, 3: spd, 4: hpd}
-    const int64_t mview_id                  // {0: full, 1: triu, 2: tril}
-) {
-
-    // Look up or create shared state from the global registry
-    auto shared = CudssBatchRegistry<T>::get_or_create(solver_id, batch_size_64);
-
-    // Create the thin wrapper that XLA will manage
-    auto wrapper = std::make_unique<CudssBatchState<T>>();
-    wrapper->shared = shared;
-
-    // Only initialize mtype/mview if this is the first instantiation (handle still null)
-    if (shared->handle == nullptr) {
-        // check on the type of matrix being solved
-        if (mtype_id == 0) {
-            shared->mtype = CUDSS_MTYPE_GENERAL;
-        } else if (mtype_id == 1) {
-            shared->mtype = CUDSS_MTYPE_SYMMETRIC;
-        } else if (mtype_id == 2) {
-            shared->mtype = CUDSS_MTYPE_HERMITIAN;
-        } else if (mtype_id == 3) {
-            shared->mtype = CUDSS_MTYPE_SPD;
-        } else if (mtype_id == 4) {
-            shared->mtype = CUDSS_MTYPE_HPD;
-        } else {
-            throw std::invalid_argument("Invalid mtype_id. Valid options: 0: general, 1: symmetric, 2: hermitian, 3: spd, 4: hpd");
-        }
-
-        // check on the view of the matrix provided
-        if (mview_id == 0) {
-            shared->mview = CUDSS_MVIEW_FULL;
-        } else if (mview_id == 1) {
-            shared->mview = CUDSS_MVIEW_UPPER;
-        } else if (mview_id == 2) {
-            shared->mview = CUDSS_MVIEW_LOWER;
-        } else {
-            throw std::invalid_argument("Invalid mview_id. Valid options: 0: full, 1: upper, 2: lower");
-        }
-
-        shared->nrhs = 1;
-
-        // CUDA setup can happen here before any cudaMallocs
-        cudaSetDevice(device_id);
-    }
-
-    return ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>>(std::move(wrapper));
-}
 
 // execution ===================================================================
 
@@ -307,234 +117,634 @@ static void create_batched_csr_structure(
     // No synchronization needed here - stream will handle dependencies
 }
 
-template <ffi::DataType T>
-static ffi::Error CudssExecute(
-    cudaStream_t stream,                    // JAXs stream given to this context (jit)
-    CudssBatchState<T>* wrapper,            // the thin wrapper we instantiated in CudssInstantiate
-    ffi::Buffer<T> b_values_buf,            // the real input data that varies per solution
-    ffi::Buffer<T> csr_values_buf,          // the real input data that varies per solution
-    ffi::Buffer<ffi::S32> offsets_buf,      // sparsity pattern row offsets
-    ffi::Buffer<ffi::S32> columns_buf,      // sparsity pattern column indices
-    ffi::Buffer<ffi::S32> refactorize_signal,      // whether we should refactorize within jit
-    ffi::Buffer<ffi::S32> solve_signal,      // whether we should solve within jit
-    ffi::Buffer<ffi::S32> ir_nsteps_signal,  // number of iterative refinement steps
-    ffi::ResultBuffer<T> out_values_buf,    // the output buffer we write the answer to
-    ffi::ResultBuffer<T> diag_buf, // the output buffer for inertia [batch_size, 3]
-    ffi::ResultBuffer<ffi::S32> perm_buf, // the output buffer for inertia [batch_size, 3]
-    const int64_t solver_id,                // unique id for shared state registry
-    const int64_t batch_size_64,               // need to know without other structural data
-    const int64_t device_id,                    // the device to run this on
-    const int64_t mtype_id,                     // {0: gen, 1: sym, 2: herm, 3: spd, 4: hpd}
-    const int64_t mview_id                      // {0: full, 1: triu, 2: tril}
-) {
 
-    // Dereference shared state from the wrapper
-    auto* state = wrapper->shared.get();
+// =============================================================================
+// Token-based persistent factorization (docs/token_design.md)
+//
+// This is THE token implementation: a single solve is just the batch_size=1
+// special case of the block-diagonal construction, so all four tiers live
+// here, over one process-global LRU registry:
+//
+//   analyze(values(B·nnz), offsets, columns)  -> token       block ANALYSIS
+//   factorize(tokens, values, ir)  -> tokens                 block FACTORIZATION
+//   refactorize(tokens, values, ir)-> tokens                 block REFACTORIZATION
+//   solve(tokens, b, ir)           -> x                      block SOLVE
+//   query(tokens)                  -> every cuDSS data item
+//
+// Phase handlers are pure phase execution; query is the ONE door to
+// post-factorization data (diag, permutations, inertia inputs, ...), returned
+// unconditionally with Python figuring out what it wants — this subsumes
+// single_solve_re.cpp. solve derives nrhs from element_count / (batch·n),
+// which makes multi-RHS on a single entry and a block solve on a batch entry
+// the same code path.
+//
+// The token buffer may carry ONE id (explicit door) or B equal copies (minted
+// by the vmap(analyze) rule, broadcast across the batch axis) — the handlers
+// validate equality, which is also where "stacked distinct tokens" fails
+// loudly.
+// =============================================================================
 
-    // Synchronize with XLA stream to ensure signal buffers have been written
-    cudaStreamSynchronize(stream);
+#define CUDSS_TOKEN_CHECK(call, msg) \
+    do { \
+        cudssStatus_t s_ = (call); \
+        if (s_ != CUDSS_STATUS_SUCCESS) { \
+            return ffi::Error::Internal( \
+                std::string("spineax pbatch token: cuDSS call failed (status ") + \
+                std::to_string(static_cast<int>(s_)) + "): " msg); \
+        } \
+    } while (0)
 
-    cudaMemcpy(&state->do_solve, solve_signal.typed_data(),
-                sizeof(int32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&state->ir_nsteps, ir_nsteps_signal.typed_data(),
-                sizeof(int32_t), cudaMemcpyDeviceToHost);
+#define CUDA_TOKEN_CHECK(call)                                  \
+  do {                                                          \
+    cudaError_t err_ = (call);                                  \
+    if (err_ != cudaSuccess) {                                  \
+      return ffi::Error::Internal(                              \
+          std::string("spineax pbatch token: CUDA call failed: ") + \
+          cudaGetErrorString(err_));                            \
+    }                                                           \
+  } while (0)
 
-    if (state->call_count == 0) {
+// Block-diagonal expansion for a BATCHED pattern (B distinct same-shape
+// patterns). The uniform-pattern case reuses create_batched_*_kernel above.
+__global__ void create_blockdiag_columns_from_batched_kernel(
+    const int32_t* __restrict__ batched_in_columns,   // (B, nnz) contiguous
+    int32_t* __restrict__ out_columns,                // (B*nnz,)
+    int64_t nnz, int64_t n, int64_t batch_size)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * nnz) {
+        int64_t batch_idx = idx / nnz;
+        out_columns[idx] = batched_in_columns[idx] + batch_idx * n;
+    }
+}
 
-        // figure this out on first call
-        state->n = offsets_buf.element_count() - 1;
-        state->nnz = columns_buf.element_count();
-
-        // Allocate device memory for batched CSR structure (done once)
-        cudaMallocAsync(&state->batched_columns_ptr, batch_size_64 * state->nnz * sizeof(int32_t), stream);
-        cudaMallocAsync(&state->batched_offsets_ptr, (batch_size_64 * state->n + 1) * sizeof(int32_t), stream);
-
-        // form the new batched offsets and ptrs here!
-        create_batched_csr_structure(
-            offsets_buf.typed_data(), columns_buf.typed_data(),
-            state->n, state->nnz, batch_size_64,
-            &state->batched_offsets_ptr, &state->batched_columns_ptr,
-            stream
-        );
-
-        // Cache the input pointers to detect pattern changes on subsequent calls
-        state->cached_offsets_ptr = offsets_buf.typed_data();
-        state->cached_columns_ptr = columns_buf.typed_data();
-
-        // CuDSS setup
-        CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
-        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
-        CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
-        CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
-
-        // CuDSS structures creation
-        int64_t batched_n = state->n * batch_size_64;
-        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, batched_n, state->nrhs, batched_n,
-            b_values_buf.typed_data(), state->cudss_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
-
-        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, batched_n, state->nrhs, batched_n,
-            out_values_buf->typed_data(), state->cudss_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
-
-        // Use singular matrix creation APIs
-        int64_t batched_nnz = state->nnz * batch_size_64;
-        CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, batched_n, batched_n, batched_nnz,
-            state->batched_offsets_ptr, NULL,
-            state->batched_columns_ptr,
-            csr_values_buf.typed_data(),
-            CUDSS_R_32I, CUDSS_R_32I, state->cudss_dtype,
-            state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
-
-        // CuDSS config - iterative refinement steps from runtime signal
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &state->ir_nsteps, sizeof(state->ir_nsteps)), state->status, "cudssConfigSet ir_nsteps");
-
-        // cold solve - analyze, factorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
-            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
-
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
-            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
-
-        if (state->do_solve) {
-            CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
-                state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
-        }
-        // so we dont init again...
-        state->call_count++;
-
-    } else {
-        // stream can change between calls!!!
-        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
-
-        // Check if sparsity pattern pointers have changed
-        int32_t* current_offsets_ptr = offsets_buf.typed_data();
-        int32_t* current_columns_ptr = columns_buf.typed_data();
-
-        if (current_offsets_ptr != state->cached_offsets_ptr ||
-            current_columns_ptr != state->cached_columns_ptr) {
-            // Pattern pointers changed - recompute batched structure
-            create_batched_csr_structure(
-                current_offsets_ptr, current_columns_ptr,
-                state->n, state->nnz, batch_size_64,
-                &state->batched_offsets_ptr, &state->batched_columns_ptr,
-                stream
-            );
-
-            // Update cached pointers
-            state->cached_offsets_ptr = current_offsets_ptr;
-            state->cached_columns_ptr = current_columns_ptr;
-        }
-        // else: Pointers unchanged - batched structure is still valid, skip kernel!
-
-        // Read refactorize signal from GPU to host (cudaMemcpy is synchronous)
-        cudaMemcpy(&state->do_refactorize, refactorize_signal.typed_data(),
-                   sizeof(int32_t), cudaMemcpyDeviceToHost);
-
-        // Update the values pointers which change between calls
-        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
-        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
-
-        // Always update A values pointer so IR uses correct matrix for residuals
-        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->A, csr_values_buf.typed_data()), state->status, "update_pointers A");
-
-        // Conditionally refactorize based on traced signal
-        if (state->do_refactorize) {
-            CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
-                state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
-        }
-
-        // Update IR steps from runtime signal before solve
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &state->ir_nsteps, sizeof(state->ir_nsteps)), state->status, "cudssConfigSet ir_nsteps");
-
-        // Conditionally solve and iterative refine
-        if (state->do_solve) {
-            CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
-                state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+__global__ void create_blockdiag_offsets_from_batched_kernel(
+    const int32_t* __restrict__ batched_in_offsets,   // (B, n+1) contiguous
+    int32_t* __restrict__ out_offsets,                // (B*n + 1,)
+    int64_t n, int64_t nnz, int64_t batch_size)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * n + 1) {
+        if (idx == batch_size * n) {
+            out_offsets[idx] = batch_size * nnz;
+        } else {
+            int64_t batch_idx = idx / n;
+            int64_t row_idx = idx % n;
+            out_offsets[idx] =
+                batched_in_offsets[batch_idx * (n + 1) + row_idx] + batch_idx * nnz;
         }
     }
+}
 
-    cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
-                    batch_size_64 * state->n * sizeof(typename get_native_data_type<T>::type), &state->sizeWritten);
-    cudssDataGet(state->handle, state->data, CUDSS_DATA_PERM_REORDER_ROW, perm_buf->typed_data(),
-                    batch_size_64 * state->n * sizeof(int32_t), &state->sizeWritten);
+// One block-diagonal factorization living in the registry. Not templated:
+// dtype is runtime metadata so all dtypes share one registry and id space.
+struct BatchFactorEntry {
+    cudssHandle_t handle = nullptr;
+    cudssConfig_t config = nullptr;
+    cudssData_t   data   = nullptr;
+    cudssMatrix_t A = nullptr;
+    cudssMatrix_t x_dummy = nullptr;
+    cudssMatrix_t b_dummy = nullptr;
+    // device memory OWNED by this entry: the expanded block-diagonal structure
+    // and a private copy of the block values
+    int32_t* d_offsets = nullptr;  // (B*n + 1,)
+    int32_t* d_columns = nullptr;  // (B*nnz,)
+    void*    d_values  = nullptr;  // (B*nnz,)
+    int64_t block_n = 0, block_nnz = 0, batch = 0;  // system N = batch*block_n
+    size_t elem_size = 0;
+    cudssDataType_t dtype = CUDSS_R_64F;
+    cudssMatrixType_t mtype = CUDSS_MTYPE_SYMMETRIC;
+    cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
+    int64_t device_id = 0;
+    enum Phase { kAnalyzed = 0, kFactorized = 1 };
+    Phase phase = kAnalyzed;
+    int32_t ir_nsteps = 0;
+    cudaStream_t last_stream = nullptr;
+    size_t size_written = 0;
 
+    ~BatchFactorEntry() {
+        if (last_stream) cudaStreamSynchronize(last_stream);
+        if (A) cudssMatrixDestroy(A);
+        if (b_dummy) cudssMatrixDestroy(b_dummy);
+        if (x_dummy) cudssMatrixDestroy(x_dummy);
+        if (data && handle) cudssDataDestroy(handle, data);
+        if (config) cudssConfigDestroy(config);
+        if (handle) cudssDestroy(handle);
+        if (d_offsets) cudaFree(d_offsets);
+        if (d_columns) cudaFree(d_columns);
+        if (d_values)  cudaFree(d_values);
+    }
+};
+
+struct BatchTokenRegistry {
+    std::mutex mu;
+    std::map<int32_t, std::shared_ptr<BatchFactorEntry>> entries;
+    std::list<int32_t> lru;  // front = most recently used
+    std::atomic<int32_t> next_id{1};
+
+    static BatchTokenRegistry& instance() {
+        static BatchTokenRegistry r;
+        return r;
+    }
+    static size_t capacity() {
+        const char* e = std::getenv("SPINEAX_FACTOR_CACHE");
+        if (e) { try { return std::stoul(e); } catch (...) {} }
+        return 8;
+    }
+    int32_t insert(std::shared_ptr<BatchFactorEntry> entry) {
+        std::lock_guard<std::mutex> lk(mu);
+        while (entries.size() >= capacity() && !lru.empty()) {
+            int32_t old = lru.back();
+            lru.pop_back();
+            entries.erase(old);
+        }
+        int32_t id = next_id.fetch_add(1);
+        entries[id] = std::move(entry);
+        lru.push_front(id);
+        return id;
+    }
+    std::shared_ptr<BatchFactorEntry> get(int32_t id) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = entries.find(id);
+        if (it == entries.end()) return nullptr;
+        lru.remove(id);
+        lru.push_front(id);
+        return it->second;
+    }
+    bool release(int32_t id) {
+        std::lock_guard<std::mutex> lk(mu);
+        lru.remove(id);
+        return entries.erase(id) > 0;
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> lk(mu);
+        return entries.size();
+    }
+};
+
+// Read the token buffer (1 or B ids), require all equal, look the entry up.
+template <ffi::DataType T>
+static ffi::Error batch_token_lookup(cudaStream_t stream,
+                                     ffi::Buffer<ffi::S32>& token_buf,
+                                     std::shared_ptr<BatchFactorEntry>* out) {
+    int64_t count = token_buf.element_count();
+    std::vector<int32_t> ids(count);
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(ids.data(), token_buf.typed_data(),
+                                     count * sizeof(int32_t),
+                                     cudaMemcpyDeviceToHost, stream));
+    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));
+    for (int64_t i = 1; i < count; ++i) {
+        if (ids[i] != ids[0]) {
+            return ffi::Error::Internal(
+                "spineax pbatch token: batched token ids differ (" +
+                std::to_string(ids[0]) + " vs " + std::to_string(ids[i]) +
+                ") — stacked distinct single-system tokens cannot be batch-"
+                "operated. Batch them at analysis time (vmap(analyze) or "
+                "batch-shaped values) so they share one block-diagonal entry.");
+        }
+    }
+    auto e = BatchTokenRegistry::instance().get(ids[0]);
+    if (!e) {
+        return ffi::Error::Internal(
+            "spineax token: unknown or evicted factorization token " +
+            std::to_string(ids[0]) + " (cache capacity " +
+            std::to_string(BatchTokenRegistry::capacity()) +
+            "; raise with SPINEAX_FACTOR_CACHE, or call release() less eagerly)");
+    }
+    if (e->dtype != get_cudss_data_type<T>()) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: dtype mismatch for token " +
+            std::to_string(ids[0]));
+    }
+    if (count != 1 && count != e->batch) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: got " + std::to_string(count) +
+            " token ids for an entry with batch size " +
+            std::to_string(e->batch));
+    }
+    *out = std::move(e);
     return ffi::Error::Success();
 }
 
-// XLA/nanobind boilerplate ====================================================
+static ffi::Error batch_token_bind_stream(BatchFactorEntry* e, cudaStream_t stream) {
+    if (e->last_stream && e->last_stream != stream) {
+        CUDA_TOKEN_CHECK(cudaStreamSynchronize(e->last_stream));
+    }
+    e->last_stream = stream;
+    CUDSS_TOKEN_CHECK(cudssSetStream(e->handle, stream), "cudssSetStream");
+    return ffi::Error::Success();
+}
 
-// XLA ffi handler definitions macro
-#define DEFINE_CUDSS_FFI_HANDLERS(TypeName, DataType) \
-    XLA_FFI_DEFINE_HANDLER(kCudssInstantiate##TypeName, CudssInstantiate<DataType>, \
-        ffi::Ffi::BindInstantiate() \
-            .Attr<int64_t>("solver_id") \
+static ffi::Error batch_token_set_ir(BatchFactorEntry* e, cudaStream_t stream,
+                                     ffi::Buffer<ffi::S32>& ir_buf) {
+    int32_t ir = 0;
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(&ir, ir_buf.typed_data(), sizeof(int32_t),
+                                     cudaMemcpyDeviceToHost, stream));
+    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));
+    if (ir != e->ir_nsteps) {
+        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_IR_N_STEPS,
+                                         &ir, sizeof(ir)),
+                          "cudssConfigSet ir_nsteps");
+        e->ir_nsteps = ir;
+    }
+    return ffi::Error::Success();
+}
+
+// analyze: expand the block-diagonal structure, run block ANALYSIS ===========
+template <ffi::DataType T>
+static ffi::Error PbatchTokenAnalyze(
+    cudaStream_t stream,
+    ffi::Buffer<T> csr_values_buf,          // (B*nnz,) contiguous == block values
+    ffi::Buffer<ffi::S32> offsets_buf,      // (n+1,) shared or (B*(n+1),) batched
+    ffi::Buffer<ffi::S32> columns_buf,      // (nnz,) shared or (B*nnz,) batched
+    ffi::ResultBuffer<ffi::S32> token_buf,  // int32[1]
+    const int64_t batch_size,
+    const int64_t pattern_batched,          // 0: shared pattern, 1: per-block
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id
+) {
+    using nat = typename get_native_data_type<T>::type;
+    CUDA_TOKEN_CHECK(cudaSetDevice(device_id));
+
+    auto e = std::make_shared<BatchFactorEntry>();
+    e->last_stream = stream;
+    e->batch = batch_size;
+    if (pattern_batched) {
+        e->block_n = offsets_buf.element_count() / batch_size - 1;
+        e->block_nnz = columns_buf.element_count() / batch_size;
+    } else {
+        e->block_n = offsets_buf.element_count() - 1;
+        e->block_nnz = columns_buf.element_count();
+    }
+    if ((int64_t)csr_values_buf.element_count() != e->batch * e->block_nnz) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: values size " +
+            std::to_string(csr_values_buf.element_count()) + " != batch*nnz = " +
+            std::to_string(e->batch * e->block_nnz));
+    }
+    e->elem_size = sizeof(nat);
+    e->dtype = get_cudss_data_type<T>();
+    e->device_id = device_id;
+
+    switch (mtype_id) {
+        case 0: e->mtype = CUDSS_MTYPE_GENERAL; break;
+        case 1: e->mtype = CUDSS_MTYPE_SYMMETRIC; break;
+        case 2: e->mtype = CUDSS_MTYPE_HERMITIAN; break;
+        case 3: e->mtype = CUDSS_MTYPE_SPD; break;
+        case 4: e->mtype = CUDSS_MTYPE_HPD; break;
+        default: return ffi::Error::Internal(
+            "spineax pbatch token: invalid mtype_id (0 general, 1 symmetric, 2 hermitian, 3 spd, 4 hpd)");
+    }
+    switch (mview_id) {
+        case 0: e->mview = CUDSS_MVIEW_FULL; break;
+        case 1: e->mview = CUDSS_MVIEW_UPPER; break;
+        case 2: e->mview = CUDSS_MVIEW_LOWER; break;
+        default: return ffi::Error::Internal(
+            "spineax pbatch token: invalid mview_id (0 full, 1 upper, 2 lower)");
+    }
+
+    const int64_t N = e->batch * e->block_n;
+    const int64_t NNZ = e->batch * e->block_nnz;
+
+    CUDA_TOKEN_CHECK(cudaMallocAsync(&e->d_offsets, (N + 1) * sizeof(int32_t), stream));
+    CUDA_TOKEN_CHECK(cudaMallocAsync(&e->d_columns, NNZ * sizeof(int32_t), stream));
+    CUDA_TOKEN_CHECK(cudaMallocAsync(&e->d_values, NNZ * sizeof(nat), stream));
+
+    // Expand the block-diagonal structure into the owned buffers.
+    const int threads = 256;
+    if (pattern_batched) {
+        int64_t total_cols = NNZ;
+        create_blockdiag_columns_from_batched_kernel<<<
+            (int)((total_cols + threads - 1) / threads), threads, 0, stream>>>(
+            columns_buf.typed_data(), e->d_columns, e->block_nnz, e->block_n, e->batch);
+        int64_t total_offs = N + 1;
+        create_blockdiag_offsets_from_batched_kernel<<<
+            (int)((total_offs + threads - 1) / threads), threads, 0, stream>>>(
+            offsets_buf.typed_data(), e->d_offsets, e->block_n, e->block_nnz, e->batch);
+    } else {
+        create_batched_csr_structure(
+            offsets_buf.typed_data(), columns_buf.typed_data(),
+            e->block_n, e->block_nnz, e->batch,
+            &e->d_offsets, &e->d_columns, stream);
+    }
+    CUDA_TOKEN_CHECK(cudaGetLastError());
+
+    // Private copy of the block values ((B, nnz) contiguous IS the block-diag
+    // values array): JAX buffers are transient, later phases re-read A.
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(e->d_values, csr_values_buf.typed_data(),
+                                     NNZ * sizeof(nat), cudaMemcpyDeviceToDevice, stream));
+
+    CUDSS_TOKEN_CHECK(cudssCreate(&e->handle), "cudssCreate");
+    CUDSS_TOKEN_CHECK(cudssSetStream(e->handle, stream), "cudssSetStream");
+    CUDSS_TOKEN_CHECK(cudssConfigCreate(&e->config), "cudssConfigCreate");
+    CUDSS_TOKEN_CHECK(cudssDataCreate(e->handle, &e->data), "cudssDataCreate");
+
+    CUDSS_TOKEN_CHECK(cudssMatrixCreateCsr(&e->A, N, N, NNZ,
+        e->d_offsets, NULL, e->d_columns, e->d_values,
+        CUDSS_R_32I, CUDSS_R_32I, e->dtype,
+        e->mtype, e->mview, CUDSS_BASE_ZERO), "cudssMatrixCreateCsr");
+
+    // Placeholder dense descriptors: ANALYSIS/FACTORIZATION never dereference
+    // x/b data, but the API requires the objects.
+    CUDSS_TOKEN_CHECK(cudssMatrixCreateDn(&e->b_dummy, N, 1, N,
+        e->d_values, e->dtype, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn b (dummy)");
+    CUDSS_TOKEN_CHECK(cudssMatrixCreateDn(&e->x_dummy, N, 1, N,
+        e->d_values, e->dtype, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn x (dummy)");
+
+    CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_ANALYSIS,
+        e->config, e->data, e->A, e->x_dummy, e->b_dummy), "cudssExecute analysis");
+    e->phase = BatchFactorEntry::kAnalyzed;
+
+    int32_t id = BatchTokenRegistry::instance().insert(std::move(e));
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(token_buf->typed_data(), &id, sizeof(int32_t),
+                                     cudaMemcpyHostToDevice, stream));
+    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));  // id is a stack local
+    return ffi::Error::Success();
+}
+
+// factorize / refactorize: block numeric phase ===============================
+// Pure phase execution: the only output is the token (dataflow). All post-
+// factorization data — diag, permutations, inertia inputs — comes from the
+// query handler below, so there is exactly one way to read it.
+template <ffi::DataType T, bool kRefactorize>
+static ffi::Error PbatchTokenNumeric(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::S32> token_in,         // 1 or B equal ids
+    ffi::Buffer<T> csr_values_buf,          // (B*nnz,)
+    ffi::Buffer<ffi::S32> ir_buf,           // int32[1]
+    ffi::ResultBuffer<ffi::S32> token_out   // same count, same ids
+) {
+    std::shared_ptr<BatchFactorEntry> e;
+    if (auto err = batch_token_lookup<T>(stream, token_in, &e); err.failure()) return err;
+
+    if ((int64_t)csr_values_buf.element_count() != e->batch * e->block_nnz) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: values size " +
+            std::to_string(csr_values_buf.element_count()) + " != batch*nnz = " +
+            std::to_string(e->batch * e->block_nnz));
+    }
+    if (kRefactorize && e->phase < BatchFactorEntry::kFactorized) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: refactorize requires a factorized token (call factorize first)");
+    }
+
+    CUDA_TOKEN_CHECK(cudaSetDevice(e->device_id));
+    if (auto err = batch_token_bind_stream(e.get(), stream); err.failure()) return err;
+    if (auto err = batch_token_set_ir(e.get(), stream, ir_buf); err.failure()) return err;
+
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(e->d_values, csr_values_buf.typed_data(),
+                                     e->batch * e->block_nnz * e->elem_size,
+                                     cudaMemcpyDeviceToDevice, stream));
+
+    CUDSS_TOKEN_CHECK(cudssExecute(e->handle,
+        kRefactorize ? CUDSS_PHASE_REFACTORIZATION : CUDSS_PHASE_FACTORIZATION,
+        e->config, e->data, e->A, e->x_dummy, e->b_dummy),
+        "cudssExecute factorization");
+    e->phase = BatchFactorEntry::kFactorized;
+
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(token_out->typed_data(), token_in.typed_data(),
+                                     token_in.element_count() * sizeof(int32_t),
+                                     cudaMemcpyDeviceToDevice, stream));
+    return ffi::Error::Success();
+}
+
+// solve: block SOLVE (multi-RHS via the layout identity on the block system) =
+template <ffi::DataType T>
+static ffi::Error PbatchTokenSolve(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::S32> token_in,  // 1 or B equal ids
+    ffi::Buffer<T> b_values_buf,     // (B*n,) or (R, B*n) row-major
+    ffi::Buffer<ffi::S32> ir_buf,    // int32[1]
+    ffi::ResultBuffer<T> out_values_buf
+) {
+    std::shared_ptr<BatchFactorEntry> e;
+    if (auto err = batch_token_lookup<T>(stream, token_in, &e); err.failure()) return err;
+
+    if (e->phase < BatchFactorEntry::kFactorized) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: solve requires a factorized token (call factorize first)");
+    }
+    const int64_t N = e->batch * e->block_n;
+    if (N == 0 || (int64_t)b_values_buf.element_count() % N != 0) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: rhs size " +
+            std::to_string(b_values_buf.element_count()) +
+            " is not a multiple of batch*n = " + std::to_string(N));
+    }
+    int64_t nrhs = b_values_buf.element_count() / N;
+
+    CUDA_TOKEN_CHECK(cudaSetDevice(e->device_id));
+    if (auto err = batch_token_bind_stream(e.get(), stream); err.failure()) return err;
+    if (auto err = batch_token_set_ir(e.get(), stream, ir_buf); err.failure()) return err;
+
+    cudssMatrix_t bmat = nullptr, xmat = nullptr;
+    CUDSS_TOKEN_CHECK(cudssMatrixCreateDn(&bmat, N, nrhs, N,
+        const_cast<typename get_native_data_type<T>::type*>(b_values_buf.typed_data()),
+        e->dtype, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn b (solve)");
+    CUDSS_TOKEN_CHECK(cudssMatrixCreateDn(&xmat, N, nrhs, N,
+        out_values_buf->typed_data(), e->dtype, CUDSS_LAYOUT_COL_MAJOR),
+        "cudssMatrixCreateDn x (solve)");
+
+    cudssStatus_t solve_status = cudssExecute(e->handle, CUDSS_PHASE_SOLVE,
+        e->config, e->data, e->A, xmat, bmat);
+    cudssMatrixDestroy(bmat);
+    cudssMatrixDestroy(xmat);
+    if (solve_status != CUDSS_STATUS_SUCCESS) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: cuDSS solve failed (status " +
+            std::to_string(static_cast<int>(solve_status)) + ")");
+    }
+    return ffi::Error::Success();
+}
+
+// query: read every cuDSS data item from a factorized token =================
+// Subsumes single_solve_re.cpp: everything is returned unconditionally
+// (zero-filled where cuDSS declines for this matrix type / config) and Python
+// figures out what it wants. Array outputs are sized by the block system
+// (N = batch * block_n); scalar outputs are block-global.
+static constexpr int64_t kNdPartitionTreeSize = (1 << 10) - 1;  // nd_nlevels=10 default
+
+template <ffi::DataType T>
+static ffi::Error PbatchTokenQuery(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::S32> token_in,                    // 1 or B equal ids
+    ffi::ResultBuffer<ffi::S64> lu_nnz_buf,            // [1]
+    ffi::ResultBuffer<ffi::S32> npivots_buf,           // [1]
+    ffi::ResultBuffer<ffi::S32> inertia_buf,           // [2] cuDSS native (block-global)
+    ffi::ResultBuffer<ffi::S32> perm_reorder_row_buf,  // [N]
+    ffi::ResultBuffer<ffi::S32> perm_reorder_col_buf,  // [N]
+    ffi::ResultBuffer<ffi::S32> perm_row_buf,          // [N] (reordering alg 1/2 only)
+    ffi::ResultBuffer<ffi::S32> perm_col_buf,          // [N] (reordering alg 1/2 only)
+    ffi::ResultBuffer<ffi::S32> perm_matching_buf,     // [N]
+    ffi::ResultBuffer<T> diag_buf,                     // [N]
+    ffi::ResultBuffer<ffi::F32> scale_row_buf,         // [N]
+    ffi::ResultBuffer<ffi::F32> scale_col_buf,         // [N]
+    ffi::ResultBuffer<ffi::S32> nd_partition_tree_buf, // [kNdPartitionTreeSize]
+    ffi::ResultBuffer<ffi::S32> nsuperpanels_buf,      // [1]
+    ffi::ResultBuffer<ffi::S64> schur_shape_buf        // [2]
+) {
+    std::shared_ptr<BatchFactorEntry> e;
+    if (auto err = batch_token_lookup<T>(stream, token_in, &e); err.failure()) return err;
+    if (e->phase < BatchFactorEntry::kFactorized) {
+        return ffi::Error::Internal(
+            "spineax token: query requires a factorized token (call factorize first)");
+    }
+    CUDA_TOKEN_CHECK(cudaSetDevice(e->device_id));
+    if (auto err = batch_token_bind_stream(e.get(), stream); err.failure()) return err;
+
+    const int64_t N = e->batch * e->block_n;
+    // The output buffers are sized by the caller's static token metadata; a
+    // mismatch (e.g. query of a vmap-minted batch token from inside vmap)
+    // must fail loudly rather than overrun the buffers.
+    if ((int64_t)diag_buf->element_count() != N) {
+        return ffi::Error::Internal(
+            "spineax token: query output size " +
+            std::to_string(diag_buf->element_count()) +
+            " != block system dimension " + std::to_string(N) +
+            " (query is an eager/outer-level operation — call it outside "
+            "vmap with batch-shaped token metadata)");
+    }
+    size_t written = 0;
+
+    // host-side scalars: dataGet to host, then H2D into the result buffer;
+    // zero on failure so Python always gets well-defined values
+    #define QUERY_HOST_SCALAR(PARAM, TYPE, COUNT, BUF) \
+        do { \
+            TYPE tmp_[COUNT] = {}; \
+            if (cudssDataGet(e->handle, e->data, PARAM, tmp_, sizeof(tmp_), \
+                             &written) != CUDSS_STATUS_SUCCESS) { \
+                for (int i_ = 0; i_ < (COUNT); ++i_) tmp_[i_] = 0; \
+            } \
+            CUDA_TOKEN_CHECK(cudaMemcpy((BUF)->typed_data(), tmp_, sizeof(tmp_), \
+                                        cudaMemcpyHostToDevice)); \
+        } while (0)
+
+    // device-side arrays: dataGet writes the device buffer directly
+    #define QUERY_DEVICE_ARRAY(PARAM, BUF, BYTES) \
+        do { \
+            if (cudssDataGet(e->handle, e->data, PARAM, (BUF)->typed_data(), \
+                             (BYTES), &written) != CUDSS_STATUS_SUCCESS) { \
+                CUDA_TOKEN_CHECK(cudaMemset((BUF)->typed_data(), 0, (BYTES))); \
+            } \
+        } while (0)
+
+    QUERY_HOST_SCALAR(CUDSS_DATA_LU_NNZ, int64_t, 1, lu_nnz_buf);
+    QUERY_HOST_SCALAR(CUDSS_DATA_NPIVOTS, int32_t, 1, npivots_buf);
+    QUERY_HOST_SCALAR(CUDSS_DATA_INERTIA, int32_t, 2, inertia_buf);
+    QUERY_HOST_SCALAR(CUDSS_DATA_NSUPERPANELS, int32_t, 1, nsuperpanels_buf);
+    QUERY_HOST_SCALAR(CUDSS_DATA_SCHUR_SHAPE, int64_t, 2, schur_shape_buf);
+
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_REORDER_ROW, perm_reorder_row_buf, N * sizeof(int32_t));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_REORDER_COL, perm_reorder_col_buf, N * sizeof(int32_t));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_ROW, perm_row_buf, N * sizeof(int32_t));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_COL, perm_col_buf, N * sizeof(int32_t));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_MATCHING, perm_matching_buf, N * sizeof(int32_t));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_DIAG, diag_buf, N * (int64_t)e->elem_size);
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_SCALE_ROW, scale_row_buf, N * sizeof(float));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_SCALE_COL, scale_col_buf, N * sizeof(float));
+    // cuDSS >= 0.8 removed CUDSS_DATA_ELIMINATION_TREE; the nested-dissection
+    // partition tree is its successor and exposes the same reordering structure.
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_ND_PARTITION_TREE, nd_partition_tree_buf,
+                       kNdPartitionTreeSize * sizeof(int32_t));
+
+    #undef QUERY_HOST_SCALAR
+    #undef QUERY_DEVICE_ARRAY
+    return ffi::Error::Success();
+}
+
+// token FFI handler definitions ===============================================
+#define DEFINE_PBATCH_TOKEN_FFI_HANDLERS(TypeName, DataType) \
+    XLA_FFI_DEFINE_HANDLER(kPbatchTokenAnalyze##TypeName, PbatchTokenAnalyze<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
             .Attr<int64_t>("batch_size") \
+            .Attr<int64_t>("pattern_batched") \
             .Attr<int64_t>("device_id") \
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id")); \
     \
-    XLA_FFI_DEFINE_HANDLER(kCudssExecute##TypeName, CudssExecute<DataType>, \
+    XLA_FFI_DEFINE_HANDLER(kPbatchTokenFactorize##TypeName, (PbatchTokenNumeric<DataType, false>), \
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
-            .Ctx<ffi::State<CudssBatchState<DataType>>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
             .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>()); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kPbatchTokenRefactorize##TypeName, (PbatchTokenNumeric<DataType, true>), \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
             .Arg<ffi::Buffer<DataType>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>()); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kPbatchTokenSolve##TypeName, PbatchTokenSolve<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<DataType>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<DataType>>()); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kPbatchTokenQuery##TypeName, PbatchTokenQuery<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Ret<ffi::Buffer<DataType>>() \
-            .Ret<ffi::Buffer<DataType>>() \
+            .Ret<ffi::Buffer<ffi::S64>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
-            /* Attributes must also be passed to execute */ \
-            .Attr<int64_t>("solver_id") \
-            .Attr<int64_t>("batch_size") \
-            .Attr<int64_t>("device_id") \
-            .Attr<int64_t>("mtype_id") \
-            .Attr<int64_t>("mview_id"));
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<DataType>>() \
+            .Ret<ffi::Buffer<ffi::F32>>() \
+            .Ret<ffi::Buffer<ffi::F32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<ffi::S64>>());
 
-// Generate all the FFI handlers using the macro
-DEFINE_CUDSS_FFI_HANDLERS(f32, ffi::F32);
-DEFINE_CUDSS_FFI_HANDLERS(f64, ffi::F64);
-DEFINE_CUDSS_FFI_HANDLERS(c64, ffi::C64);
-DEFINE_CUDSS_FFI_HANDLERS(c128, ffi::C128);
+DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f32, ffi::F32);
+DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f64, ffi::F64);
+DEFINE_PBATCH_TOKEN_FFI_HANDLERS(c64, ffi::C64);
+DEFINE_PBATCH_TOKEN_FFI_HANDLERS(c128, ffi::C128);
 
-#if defined(XLA_FFI_API_MINOR) && (XLA_FFI_API_MINOR >= 2)
-  #define ADD_TYPE(d, DTYPE) do { \
-      using StateT = CudssBatchState<DTYPE>; \
-      static auto kStateTypeInfo = xla::ffi::MakeTypeInfo<StateT>(); \
-      (d)["type_info"] = nb::capsule(reinterpret_cast<void*>(&kStateTypeInfo)); \
-      (d)["type_id"]   = nb::capsule(reinterpret_cast<void*>(&StateT::id)); \
-    } while (0)
-#else
-  #define ADD_TYPE(d, DTYPE) do { \
-      (d)["state_type"] = nb::dict(); \
-    } while (0)
-#endif
-
-// nanobind module exporting macro
-#define EXPORT_CUDSS_HANDLERS(m, TypeName, DataType) \
-    m.def("state_dict_" #TypeName, []() { \
+#define EXPORT_PBATCH_TOKEN_HANDLERS(m, TypeName) \
+    m.def("token_handlers_" #TypeName, []() { \
         nb::dict d; \
-        ADD_TYPE(d, DataType); \
-        return d; \
-    }); \
-    m.def("type_id_" #TypeName, []() { \
-        return nb::capsule(reinterpret_cast<void*>(&CudssBatchState<DataType>::id)); \
-    }); \
-    m.def("handler_" #TypeName, []() { \
-        nb::dict d; \
-        d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
-        d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecute##TypeName)); \
+        d["analyze"] = nb::capsule(reinterpret_cast<void*>(kPbatchTokenAnalyze##TypeName)); \
+        d["factorize"] = nb::capsule(reinterpret_cast<void*>(kPbatchTokenFactorize##TypeName)); \
+        d["refactorize"] = nb::capsule(reinterpret_cast<void*>(kPbatchTokenRefactorize##TypeName)); \
+        d["solve"] = nb::capsule(reinterpret_cast<void*>(kPbatchTokenSolve##TypeName)); \
+        d["query"] = nb::capsule(reinterpret_cast<void*>(kPbatchTokenQuery##TypeName)); \
         return d; \
     });
 
 // generate all nanobind modules! :)
 NB_MODULE(pbatch_solve, m) {
-    EXPORT_CUDSS_HANDLERS(m, f32, ffi::F32);
-    EXPORT_CUDSS_HANDLERS(m, f64, ffi::F64);
-    EXPORT_CUDSS_HANDLERS(m, c64, ffi::C64);
-    EXPORT_CUDSS_HANDLERS(m, c128, ffi::C128);
+
+    EXPORT_PBATCH_TOKEN_HANDLERS(m, f32);
+    EXPORT_PBATCH_TOKEN_HANDLERS(m, f64);
+    EXPORT_PBATCH_TOKEN_HANDLERS(m, c64);
+    EXPORT_PBATCH_TOKEN_HANDLERS(m, c128);
+
+    m.def("token_release", [](int32_t id) {
+        return BatchTokenRegistry::instance().release(id);
+    });
+    m.def("token_registry_size", []() {
+        return BatchTokenRegistry::instance().size();
+    });
+    m.def("token_cache_capacity", []() {
+        return BatchTokenRegistry::instance().capacity();
+    });
+    m.def("nd_partition_tree_size", []() {
+        return kNdPartitionTreeSize;
+    });
 }
