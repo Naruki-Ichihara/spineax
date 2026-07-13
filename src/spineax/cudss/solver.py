@@ -26,7 +26,13 @@ effects_lib.control_flow_allowed_effects.add_type(_CudssSolverEffect)
 jax.devices()
 
 # Import the functions that return pointers from our compiled C++
-from spineax import single_solve, batch_solve, pbatch_solve
+from spineax import single_solve, batch_solve
+try:
+    from spineax import pbatch_solve
+    PBATCH_AVAILABLE = True
+except ImportError:
+    pbatch_solve = None
+    PBATCH_AVAILABLE = False
 
 # primitives ===================================================================
 # single
@@ -218,13 +224,12 @@ def general_batch_solve_impl(
         name,
         (
             jax.ShapeDtypeStruct(b_values.shape, b_values.dtype),   # x
-            jax.ShapeDtypeStruct((b_values.size,), b_values.dtype),   # diag
-            jax.ShapeDtypeStruct((b_values.size,), jnp.int32),        # perm_reorder_row
+            jax.ShapeDtypeStruct((batch_size, 2), jnp.int32),       # inertia
         ),
         has_side_effect=True
     )
 
-    x, diag, perm = call(
+    x, inertia = call(
         b_values, 
         csr_values, 
         csr_offsets,
@@ -235,9 +240,6 @@ def general_batch_solve_impl(
         mview_id = mview_id,
     )
 
-    # Compute inertia instead of returning diag and perm
-    matrix_dim = b_values.shape[1]  # Assuming b_values shape is (batch_size, n)
-    inertia = compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim)
     return [x, inertia]
 
 
@@ -302,16 +304,29 @@ def general_pbatch_solve_impl(
     return [x, inertia]
 
 # registrations and lowerings ==================================================
+try:
+    from jax._src.lib import jaxlib_extension_version
+    _NEW_FFI_API = jaxlib_extension_version >= 381
+except ImportError:
+    _NEW_FFI_API = False
+
+
+def register_ffi(name: str, func, *, type: str, platform: str = "CUDA"):
+    handler = getattr(func, f"handler_{type}")()
+    state_dict = getattr(func, f"state_dict_{type}")()
+    type_id = getattr(func, f"type_id_{type}")()
+    if _NEW_FFI_API:
+        jax.ffi.register_ffi_type(name, state_dict, platform=platform)
+    else:
+        jax.ffi.register_ffi_type_id(name, type_id, platform=platform)
+    # order matters, ffi_target needs to be registered after type
+    jax.ffi.register_ffi_target(name, handler, platform=platform)
 
 # single
-jax.ffi.register_ffi_target("solve_single_f32", single_solve.handler_f32(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_single_f32", single_solve.type_id_f32(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_single_f64", single_solve.handler_f64(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_single_f64", single_solve.type_id_f64(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_single_c64", single_solve.handler_c64(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_single_c64", single_solve.type_id_c64(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_single_c128", single_solve.handler_c128(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_single_c128", single_solve.type_id_c128(), platform="CUDA")
+register_ffi("solve_single_f32", single_solve, type="f32")
+register_ffi("solve_single_f64", single_solve, type="f64")
+register_ffi("solve_single_c64", single_solve, type="c64")
+register_ffi("solve_single_c128", single_solve, type="c128")
 
 solve_single_f32_low = mlir.lower_fun(solve_single_f32_impl, multiple_results=True)
 mlir.register_lowering(solve_single_f32_p, solve_single_f32_low)
@@ -323,14 +338,10 @@ solve_single_c128_low = mlir.lower_fun(solve_single_c128_impl, multiple_results=
 mlir.register_lowering(solve_single_c128_p, solve_single_c128_low)
 
 # batch
-jax.ffi.register_ffi_target("solve_batch_f32", batch_solve.handler_f32(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_batch_f32", batch_solve.type_id_f32(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_batch_f64", batch_solve.handler_f64(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_batch_f64", batch_solve.type_id_f64(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_batch_c64", batch_solve.handler_c64(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_batch_c64", batch_solve.type_id_c64(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_batch_c128", batch_solve.handler_c128(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_batch_c128", batch_solve.type_id_c128(), platform="CUDA")
+register_ffi("solve_batch_f32", batch_solve, type="f32")
+register_ffi("solve_batch_f64", batch_solve, type="f64")
+register_ffi("solve_batch_c64", batch_solve, type="c64")
+register_ffi("solve_batch_c128", batch_solve, type="c128")
 
 solve_batch_f32_low = mlir.lower_fun(solve_batch_f32_impl, multiple_results=True)
 mlir.register_lowering(solve_batch_f32_p, solve_batch_f32_low)
@@ -341,24 +352,21 @@ mlir.register_lowering(solve_batch_c64_p, solve_batch_c64_low)
 solve_batch_c128_low = mlir.lower_fun(solve_batch_c128_impl, multiple_results=True)
 mlir.register_lowering(solve_batch_c128_p, solve_batch_c128_low)
 
-# psuedo batch
-jax.ffi.register_ffi_target("solve_pbatch_f32", pbatch_solve.handler_f32(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_pbatch_f32", pbatch_solve.type_id_f32(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_pbatch_f64", pbatch_solve.handler_f64(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_pbatch_f64", pbatch_solve.type_id_f64(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_pbatch_c64", pbatch_solve.handler_c64(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_pbatch_c64", pbatch_solve.type_id_c64(), platform="CUDA")
-jax.ffi.register_ffi_target("solve_pbatch_c128", pbatch_solve.handler_c128(), platform="CUDA")
-jax.ffi.register_ffi_type_id("solve_pbatch_c128", pbatch_solve.type_id_c128(), platform="CUDA")
+# psuedo batch (optional - may not be available if CUDA version mismatch)
+if PBATCH_AVAILABLE:
+    register_ffi("solve_pbatch_f32", pbatch_solve, type="f32")
+    register_ffi("solve_pbatch_f64", pbatch_solve, type="f64")
+    register_ffi("solve_pbatch_c64", pbatch_solve, type="c64")
+    register_ffi("solve_pbatch_c128", pbatch_solve, type="c128")
 
-solve_pbatch_f32_low = mlir.lower_fun(solve_pbatch_f32_impl, multiple_results=True)
-mlir.register_lowering(solve_pbatch_f32_p, solve_pbatch_f32_low)
-solve_pbatch_f64_low = mlir.lower_fun(solve_pbatch_f64_impl, multiple_results=True)
-mlir.register_lowering(solve_pbatch_f64_p, solve_pbatch_f64_low)
-solve_pbatch_c64_low = mlir.lower_fun(solve_pbatch_c64_impl, multiple_results=True)
-mlir.register_lowering(solve_pbatch_c64_p, solve_pbatch_c64_low)
-solve_pbatch_c128_low = mlir.lower_fun(solve_pbatch_c128_impl, multiple_results=True)
-mlir.register_lowering(solve_pbatch_c128_p, solve_pbatch_c128_low)
+    solve_pbatch_f32_low = mlir.lower_fun(solve_pbatch_f32_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_f32_p, solve_pbatch_f32_low)
+    solve_pbatch_f64_low = mlir.lower_fun(solve_pbatch_f64_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_f64_p, solve_pbatch_f64_low)
+    solve_pbatch_c64_low = mlir.lower_fun(solve_pbatch_c64_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_c64_p, solve_pbatch_c64_low)
+    solve_pbatch_c128_low = mlir.lower_fun(solve_pbatch_c128_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_c128_p, solve_pbatch_c128_low)
 
 # abstract evaluations =========================================================
 @solve_single_f32_p.def_effectful_abstract_eval
@@ -581,7 +589,15 @@ def solve_single_c64_vmap(vector_arg_values, batch_axes, **kwargs):
 def solve_single_c128_vmap(vector_arg_values, batch_axes, **kwargs):
     return general_solve_vmap(vector_arg_values, batch_axes, **kwargs)
 
-vmap_using_pseudo_batch = True
+# Use pseudo_batch if available (provides correct inertia), fall back to batch_solve otherwise
+vmap_using_pseudo_batch = PBATCH_AVAILABLE
+if not PBATCH_AVAILABLE:
+    import warnings
+    warnings.warn(
+        "pbatch_solve not available (CUDA version mismatch?). "
+        "Falling back to batch_solve. Batched inertia will not be computed correctly.",
+        RuntimeWarning
+    )
 
 def general_solve_vmap(
     vector_arg_values: tuple[Array, ...],       # [b_values, csr_values, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal]
@@ -630,8 +646,39 @@ def general_solve_vmap(
         return solve(*vector_arg_values, **kwargs), (None, None)
 
     # if only one of the sets of values are batched
-    elif a_val or a_b is None:
-        raise NotImplementedError("Both csr_values and b_values must be batched")
+    elif (a_val is None) != (a_b is None):
+        if a_b is not None and a_val is None:
+            # Only b is batched - broadcast csr_values to match batch dimension
+            csr_values_batched = jnp.broadcast_to(csr_values[None, :], (b_values.shape[0],) + csr_values.shape)
+            vector_arg_values = (b_values, csr_values_batched, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal)
+
+            if vmap_using_pseudo_batch:
+                if csr_values.dtype == jnp.float32:
+                    solver = solve_pbatch_f32_p
+                elif csr_values.dtype == jnp.float64:
+                    solver = solve_pbatch_f64_p
+                elif csr_values.dtype == jnp.complex64:
+                    solver = solve_pbatch_c64_p
+                elif csr_values.dtype == jnp.complex128:
+                    solver = solve_pbatch_c128_p
+                else:
+                    raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
+            else:
+                if csr_values.dtype == jnp.float32:
+                    solver = solve_batch_f32_p
+                elif csr_values.dtype == jnp.float64:
+                    solver = solve_batch_f64_p
+                elif csr_values.dtype == jnp.complex64:
+                    solver = solve_batch_c64_p
+                elif csr_values.dtype == jnp.complex128:
+                    solver = solve_batch_c128_p
+                else:
+                    raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
+
+            return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0, 0)
+        else:
+            # Only csr_values is batched (not b) - not supported
+            raise NotImplementedError("Only csr_values batched (not b_values) is not supported")
 
     # the batched path binding
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is False:
@@ -645,7 +692,7 @@ def general_solve_vmap(
             solver = solve_batch_c128_p
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
-        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0,0)
+        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0, 0)
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is True:
         if csr_values.dtype == jnp.float32:
             solver = solve_pbatch_f32_p
@@ -658,7 +705,8 @@ def general_solve_vmap(
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
-        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0,0)
+        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0, 0)
+
 
     else:
         raise NotImplementedError("This path should not be possible")
@@ -715,8 +763,54 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
         return solve(*vector_arg_values, **kwargs), (None, None)
 
     # if only one of the sets of values are batched
-    elif a_val or a_b is None:
-        raise NotImplementedError("Both csr_values and b_values must be batched")
+    elif (a_val is None) != (a_b is None):
+        if a_b is not None and a_val is None:
+            # Only b is batched in nested vmap - broadcast csr_values
+            csr_values_batched = jnp.broadcast_to(csr_values[None, :, :], (b_values.shape[0],) + csr_values.shape)
+            b_flat = b_values.reshape(-1, b_values.shape[-1])
+            csr_flat = csr_values_batched.reshape(-1, csr_values.shape[-1])
+
+            if vmap_using_pseudo_batch:
+                if csr_values.dtype == jnp.float32:
+                    solver = solve_pbatch_f32_p
+                elif csr_values.dtype == jnp.float64:
+                    solver = solve_pbatch_f64_p
+                elif csr_values.dtype == jnp.complex64:
+                    solver = solve_pbatch_c64_p
+                elif csr_values.dtype == jnp.complex128:
+                    solver = solve_pbatch_c128_p
+                else:
+                    raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
+            else:
+                if csr_values.dtype == jnp.float32:
+                    solver = solve_batch_f32_p
+                elif csr_values.dtype == jnp.float64:
+                    solver = solve_batch_f64_p
+                elif csr_values.dtype == jnp.complex64:
+                    solver = solve_batch_c64_p
+                elif csr_values.dtype == jnp.complex128:
+                    solver = solve_batch_c128_p
+                else:
+                    raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
+
+            total_batch = b_flat.shape[0]
+            # Remove old batch_size from kwargs
+            kwargs_copy = dict(kwargs)
+            kwargs_copy.pop("batch_size", None)
+            x_flat, inertia_flat = solver.bind(
+                b_flat, csr_flat, csr_offsets, csr_columns,
+                batch_size=total_batch,
+                **kwargs_copy
+            )
+
+            # Reshape back
+            x = x_flat.reshape(b_values.shape[0], b_values.shape[1], -1)
+            inertia = inertia_flat.reshape(b_values.shape[0], b_values.shape[1], 2)
+
+            return (x, inertia), (0, 0)
+        else:
+            # Only csr_values is batched (not b) - not supported
+            raise NotImplementedError("Only csr_values batched (not b_values) is not supported")
 
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is False:
         if csr_values.dtype == jnp.float32:
@@ -729,7 +823,10 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
             solver = solve_batch_c128_p
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
-        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0,0)
+        # Remove batch_size from kwargs if present (happens with nested vmap)
+        kwargs_copy = dict(kwargs)
+        kwargs_copy.pop("batch_size", None)
+        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs_copy), (0,0)
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is True:
         if csr_values.dtype == jnp.float32:
             solver = solve_pbatch_f32_p
@@ -742,13 +839,14 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
-    # we are replacing this
-    kwargs.__delitem__("batch_size")
+    # Remove batch_size from kwargs if present (happens with nested vmap)
+    kwargs_copy = dict(kwargs)
+    kwargs_copy.pop("batch_size", None)
 
     x_flat, inertia_flat = solver.bind(
         b_flat, csr_flat, csr_offsets, csr_columns, refactorize_signal, solve_signal, ir_nsteps_signal,
         batch_size=total_batch,
-        **kwargs
+        **kwargs_copy
     )
 
     # Reshape back
@@ -793,7 +891,7 @@ class CuDSSSolver(eqx.Module):
             device_id=self.device_id,
             mtype_id=self.mtype_id,
             mview_id=self.mview_id
-        )  
+        )
     
 
 def make_test_matrices():
@@ -1081,5 +1179,4 @@ if __name__ == "__main__":
 
     # see difference between dense solves and cuDSS
     pass
-
 

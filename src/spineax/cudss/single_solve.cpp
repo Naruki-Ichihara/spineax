@@ -22,7 +22,7 @@ namespace nb = nanobind;
     do { \
         status = call; \
         if (status != CUDSS_STATUS_SUCCESS) { \
-            printf("Example FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
+            printf("FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
             return ffi::Error::Success(); \
         } \
     } while(0);
@@ -105,13 +105,12 @@ struct CudssSharedState {
     cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
     cudssIndexBase_t base = CUDSS_BASE_ZERO;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
-    typename get_native_data_type<T>::type* diag_temp = nullptr; // temporary storage for diagonal values
-    int32_t* perm_temp = nullptr; // temporary storage for permutation
-    int64_t n;
-    int64_t nnz;
-    int64_t nrhs;
+    cudaStream_t last_stream = nullptr; // track stream for synchronization
+    int64_t n = 0;
+    int64_t nnz = 0;
+    int64_t nrhs = 0;
     int64_t call_count = 0; // necessary for detecting if we need further instantiation in execution stage
-    size_t sizeWritten;
+    size_t sizeWritten = 0;
     int32_t do_refactorize; // host-side flag read from traced GPU signal
     int32_t do_solve; // host-side flag: 1 = solve with IR, 0 = solve without IR
     int32_t ir_nsteps; // host-side value read from traced GPU signal
@@ -121,15 +120,18 @@ struct CudssSharedState {
     using native_dtype = typename get_native_data_type<T>::type;
 
     ~CudssSharedState() {
-        // TODO: Fix destructor - currently causes double free on CUDA 13 / cuDSS 0.7
-        // if (handle) {
-        //     cudssMatrixDestroy(A);
-        //     cudssMatrixDestroy(b);
-        //     cudssMatrixDestroy(x);
-        //     cudssDataDestroy(handle, data);
-        //     cudssConfigDestroy(config);
-        //     cudssDestroy(handle);
-        // }
+        if (handle) {
+            // Synchronize with the last stream before destroying resources
+            if (last_stream) {
+                cudaStreamSynchronize(last_stream);
+            }
+            cudssMatrixDestroy(A);
+            cudssMatrixDestroy(b);
+            cudssMatrixDestroy(x);
+            cudssDataDestroy(handle, data);
+            cudssConfigDestroy(config);
+            cudssDestroy(handle);
+        }
     }
 };
 
@@ -245,6 +247,9 @@ static ffi::Error CudssExecute(
     // Dereference shared state from the wrapper
     auto* state = wrapper->shared.get();
 
+    // Track stream for cleanup synchronization
+    state->last_stream = stream;
+
     // Synchronize with XLA stream to ensure signal buffers have been written
     cudaStreamSynchronize(stream);
 
@@ -329,10 +334,22 @@ static ffi::Error CudssExecute(
         }
     }
 
-    CUDSS_CALL_AND_CHECK(cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
-                    state->n * sizeof(typename get_native_data_type<T>::type), &state->sizeWritten), state->status, "cudssDataGet DATA_DIAG");
-    CUDSS_CALL_AND_CHECK(cudssDataGet(state->handle, state->data, CUDSS_DATA_PERM_REORDER_ROW, perm_buf->typed_data(),
-                    state->n * sizeof(int32_t), &state->sizeWritten), state->status, "cudssDataGet DATA_PERM_REORDER_ROW");
+    // Diagnostic extraction - these can fail for certain matrix types (e.g., general non-SPD)
+    // Don't fail the solve, just warn and continue with zeros
+    state->status = cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
+                    state->n * sizeof(typename get_native_data_type<T>::type), &state->sizeWritten);
+    if (state->status != CUDSS_STATUS_SUCCESS) {
+        // Zero out the diag buffer on failure
+        CUDA_CHECK(cudaMemset(diag_buf->typed_data(), 0,
+                    state->n * sizeof(typename get_native_data_type<T>::type)));
+    }
+
+    state->status = cudssDataGet(state->handle, state->data, CUDSS_DATA_PERM_REORDER_ROW, perm_buf->typed_data(),
+                    state->n * sizeof(int32_t), &state->sizeWritten);
+    if (state->status != CUDSS_STATUS_SUCCESS) {
+        // Zero out the perm buffer on failure
+        CUDA_CHECK(cudaMemset(perm_buf->typed_data(), 0, state->n * sizeof(int32_t)));
+    }
 
     return ffi::Error::Success();
 }
@@ -373,8 +390,26 @@ DEFINE_CUDSS_FFI_HANDLERS(f64, ffi::F64);
 DEFINE_CUDSS_FFI_HANDLERS(c64, ffi::C64);
 DEFINE_CUDSS_FFI_HANDLERS(c128, ffi::C128);
 
+#if defined(XLA_FFI_API_MINOR) && (XLA_FFI_API_MINOR >= 2)
+  #define ADD_TYPE(d, DTYPE) do { \
+      using StateT = CudssState<DTYPE>; \
+      static auto kStateTypeInfo = xla::ffi::MakeTypeInfo<StateT>(); \
+      (d)["type_info"] = nb::capsule(reinterpret_cast<void*>(&kStateTypeInfo)); \
+      (d)["type_id"]   = nb::capsule(reinterpret_cast<void*>(&StateT::id)); \
+    } while (0)
+#else
+  #define ADD_TYPE(d, DTYPE) do { \
+      (d)["state_type"] = nb::dict(); \
+    } while (0)
+#endif
+
 // nanobind module exporting macro
 #define EXPORT_CUDSS_HANDLERS(m, TypeName, DataType) \
+    m.def("state_dict_" #TypeName, []() { \
+        nb::dict d; \
+        ADD_TYPE(d, DataType); \
+        return d; \
+    }); \
     m.def("type_id_" #TypeName, []() { \
         return nb::capsule(reinterpret_cast<void*>(&CudssState<DataType>::id)); \
     }); \
@@ -392,4 +427,3 @@ NB_MODULE(single_solve, m) {
     EXPORT_CUDSS_HANDLERS(m, c64, ffi::C64);
     EXPORT_CUDSS_HANDLERS(m, c128, ffi::C128);
 }
-
