@@ -8,25 +8,27 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "spineax"
 version = "0.0.2"
-requires-python = ">=3.10"
+# nanobind's stable ABI (STABLE_ABI in CMakeLists.txt) needs CPython >= 3.12.
+# One cp312-abi3 wheel then covers 3.12, 3.13, 3.14, ...
+requires-python = ">=3.12"
 authors = [
     {name = "John Viljoen"}
 ]
+# This distribution is CUDA-13 only: the compiled module links libcudart.so.13,
+# so its CUDA runtime is a hard dependency (pulled from the nvidia pip wheels and
+# located at runtime via the $ORIGIN/../nvidia/cu13/lib RPATH baked in by CMake).
+# A CUDA-12 build links libcudart.so.12 and cannot share this wheel or its name;
+# it would ship as a separate package (e.g. spineax-cu12), since pip cannot pick a
+# wheel by CUDA major.
 dependencies = [
+    "jax[cuda13]>=0.8.0",       # brings jaxlib (XLA/FFI) + nvidia-cuda-runtime-cu13
+    "nvidia-cudss-cu13>=0.8.0", # the cuDSS runtime (libcudss.so.0)
     "jaxtyping",
     "equinox",
     "lineax",
 ]
 
 [project.optional-dependencies]
-cuda12 = [
-    "jax[cuda12]>=0.5.0",
-    "nvidia-cudss-cu12>=0.8.0",
-]
-cuda13 = [
-    "jax[cuda13]>=0.8.0",
-    "nvidia-cudss-cu13>=0.8.0",
-]
 dev = [
     "nanobind",
     "ninja",
@@ -45,3 +47,31 @@ include = ["spineax/**", "CMakeLists.txt"]
 minimum-version = "0.5"
 build-dir = "build/{wheel_tag}"
 editable.rebuild = true
+
+[tool.scikit-build.wheel]
+# Emit an abi3 wheel tagged cp312-abi3-* (paired with STABLE_ABI in CMakeLists.txt).
+py-api = "cp312"
+
+# --- Wheel building (cibuildwheel) --------------------------------------------
+# Ship a single manylinux_2_28 / x86_64 / cp312-abi3 wheel for CUDA 13.
+[tool.cibuildwheel]
+# One abi3 build serves every CPython >= 3.12, so only build on 3.12.
+build = "cp312-*"
+skip = "*-musllinux*"
+archs = ["x86_64"]
+# The native module forces JAX to initialise a CUDA context on import, so the
+# wheel cannot be imported (let alone tested) on the CPU-only build runners.
+test-command = ""
+
+[tool.cibuildwheel.linux]
+# glibc 2.28 baseline (RHEL/AlmaLinux 8) — the same target as jaxlib & cuDSS wheels.
+manylinux-x86_64-image = "manylinux_2_28"
+# Reproduce the repo's proven local build (see README): CUDA headers/libs and the
+# XLA FFI headers come from the pip wheels, so install them and build without
+# isolation rather than pulling the whole jax CUDA stack into an isolated env.
+before-build = "pip install 'scikit-build-core>=0.5' nanobind 'jax[cuda13]>=0.8.0' nvidia-cudss-cu13"
+build-frontend = { name = "pip", args = ["--no-build-isolation"] }
+# Do NOT vendor the CUDA/cuDSS runtime into the wheel — it is provided by the
+# nvidia-cudss-cu13 / jax[cuda13] dependency wheels and found via the
+# $ORIGIN/../nvidia/cu13/lib RPATH. auditwheel still re-tags to manylinux_2_28.
+repair-wheel-command = "auditwheel repair --exclude libcudss.so.0 --exclude libcudart.so.13 --exclude libcublas.so.13 -w {dest_dir} {wheel}"

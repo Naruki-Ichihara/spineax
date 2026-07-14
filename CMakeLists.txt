@@ -1,11 +1,16 @@
-cmake_minimum_required(VERSION 3.15...3.27)
+# 3.26 is the floor for find_package(Python COMPONENTS Development.SABIModule),
+# which nanobind's STABLE_ABI (abi3 wheel) build requires.
+cmake_minimum_required(VERSION 3.26...3.27)
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 # Force all CUDA libraries to be linked dynamically.
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 # 1. Find the Python interpreter from your active environment.
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+# Development.SABIModule is required so nanobind's STABLE_ABI actually engages and
+# emits a limited-API pbatch_solve.abi3.so; without it STABLE_ABI is silently
+# ignored and the module is built version-specific (e.g. .cpython-313.so).
+find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
 message(STATUS "Using Python interpreter: ${Python_EXECUTABLE}")
 
 # 2. Use NVIDIA libs from Python site-packages/nvidia/*/ (directories there contain include/ and lib/).
@@ -161,7 +166,12 @@ endif()
 # of the block-diagonal construction, so this one module is the whole backend.
 # Plain C++ since the zero-copy redesign (design doc step 10): no device code,
 # only CUDA runtime API calls — nvcc is NOT required to build spineax.
-nanobind_add_module(pbatch_solve NOMINSIZE
+#
+# STABLE_ABI: compile against CPython's limited API (Py_LIMITED_API) so a single
+# abi3 wheel works on every CPython >= 3.12. nanobind requires >= 3.12 for stable
+# ABI, which is why pyproject sets requires-python = ">=3.12". Paired with
+# [tool.scikit-build.wheel] py-api = "cp312" so the wheel is tagged cp312-abi3.
+nanobind_add_module(pbatch_solve STABLE_ABI NOMINSIZE
   spineax/cudss/solver.cpp
 )
 
