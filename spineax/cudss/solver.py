@@ -663,30 +663,64 @@ _QUERY_FIELDS = (
 )
 
 
+# Fields whose (N,)-sized values are in INPUT ORDER, so a block-diagonal
+# system splits them cleanly into per-block (B, n) slices. Everything else is
+# block-global: under vmap it is broadcast unchanged to every batch element
+# (perm VALUES index the whole block system; lu_nnz/npivots/inertia/
+# nd_partition_tree/nsuperpanels/schur_shape describe the one factorization).
+_QUERY_SPLIT_FIELDS = frozenset({"diag", "scale_row", "scale_col"})
+
+
+@lru_cache(maxsize=None)
+def _make_query(suffix, dtype, n, tree):
+    """token.id -> tuple of the 14 query outputs for a system of dimension n."""
+
+    @jax.custom_batching.custom_vmap
+    def query_id(token_id):
+        fn = jax.ffi.ffi_call(
+            f"spineax_token_query_{suffix}",
+            (
+                jax.ShapeDtypeStruct((1,), jnp.int64),        # lu_nnz
+                jax.ShapeDtypeStruct((1,), jnp.int32),        # npivots
+                jax.ShapeDtypeStruct((2,), jnp.int32),        # inertia (cuDSS native)
+                jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_reorder_row
+                jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_reorder_col
+                jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_row
+                jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_col
+                jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_matching
+                jax.ShapeDtypeStruct((n,), dtype),            # diag
+                jax.ShapeDtypeStruct((n,), jnp.float32),      # scale_row
+                jax.ShapeDtypeStruct((n,), jnp.float32),      # scale_col
+                jax.ShapeDtypeStruct((tree,), jnp.int32),     # nd_partition_tree
+                jax.ShapeDtypeStruct((1,), jnp.int32),        # nsuperpanels
+                jax.ShapeDtypeStruct((2,), jnp.int64),        # schur_shape
+            ),
+            has_side_effect=True,
+        )
+        return tuple(fn(token_id))
+
+    @query_id.def_vmap
+    def _(axis_size, in_batched, token_id):
+        # Batched ids are B equal copies of ONE block entry: run a single
+        # query on the whole B*n block system, then split the input-ordered
+        # per-block fields to (B, n) and broadcast the block-global rest.
+        del in_batched
+        outs = _make_query(suffix, dtype, axis_size * n, tree)(token_id[0])
+        batched = []
+        for field, a in zip(_QUERY_FIELDS, outs):
+            if field in _QUERY_SPLIT_FIELDS:
+                batched.append(a.reshape(axis_size, n))
+            else:
+                batched.append(jnp.broadcast_to(a, (axis_size,) + a.shape))
+        return tuple(batched), (True,) * len(_QUERY_FIELDS)
+
+    return query_id
+
+
 def query(token: FactorToken) -> dict:
     B = _batch_of(token)
-    N = B * token.n
     tree = int(_ps.nd_partition_tree_size())
-    fn = jax.ffi.ffi_call(
-        f"spineax_token_query_{_suffix(token.dtype)}",
-        (
-            jax.ShapeDtypeStruct((1,), jnp.int64),        # lu_nnz
-            jax.ShapeDtypeStruct((1,), jnp.int32),        # npivots
-            jax.ShapeDtypeStruct((2,), jnp.int32),        # inertia (cuDSS native)
-            jax.ShapeDtypeStruct((N,), jnp.int32),        # perm_reorder_row
-            jax.ShapeDtypeStruct((N,), jnp.int32),        # perm_reorder_col
-            jax.ShapeDtypeStruct((N,), jnp.int32),        # perm_row
-            jax.ShapeDtypeStruct((N,), jnp.int32),        # perm_col
-            jax.ShapeDtypeStruct((N,), jnp.int32),        # perm_matching
-            jax.ShapeDtypeStruct((N,), token.dtype),      # diag
-            jax.ShapeDtypeStruct((N,), jnp.float32),      # scale_row
-            jax.ShapeDtypeStruct((N,), jnp.float32),      # scale_col
-            jax.ShapeDtypeStruct((tree,), jnp.int32),     # nd_partition_tree
-            jax.ShapeDtypeStruct((1,), jnp.int32),        # nsuperpanels
-            jax.ShapeDtypeStruct((2,), jnp.int64),        # schur_shape
-        ),
-        has_side_effect=True,
-    )
+    fn = _make_query(_suffix(token.dtype), token.dtype, B * token.n, tree)
     return dict(zip(_QUERY_FIELDS, fn(token.id)))
 
 
@@ -728,7 +762,7 @@ def cache_capacity() -> int:
     return int(_ps.token_cache_capacity())
 
 
-# lineax front door — the default user-facing API =============================
+# lineax front door — the default user-facing API ==============================
 
 class CSRSymmetricOperator(lx.AbstractLinearOperator):
     """A symmetric matrix in CSR form (full pattern, values as the one leaf).
@@ -822,7 +856,7 @@ class CuDSS(lx.AbstractLinearSolver):
     mtype_id: int = eqx.field(static=True, default=1)
     mview_id: int = eqx.field(static=True, default=0)
 
-    # explicit phases ----------------------------------------------------
+    # explicit phases ----------------------------------------------------------
 
     def analyze(self, operator):
         return analyze(operator.values, operator.offsets, operator.columns,
@@ -840,7 +874,7 @@ class CuDSS(lx.AbstractLinearSolver):
     def query(self, token):
         return query(token)
 
-    # lineax protocol ----------------------------------------------------
+    # lineax protocol ----------------------------------------------------------
 
     def init(self, operator, options):
         del options

@@ -353,6 +353,46 @@ def test_inertia_heterogeneous_batch_attribution():
     np.testing.assert_array_equal(np.asarray(inertia), expected)
 
 
+def test_query_inertia_under_vmap():
+    """query composes with vmap: ONE block query, input-ordered fields (diag,
+    scales) split per block, block-global fields broadcast. Per-element
+    inertia(query(token)) is what an IPM's inertia-correction loop reads
+    inside a vmapped solver."""
+    _require_gpu()
+    n = 40
+    rng = np.random.default_rng(32)
+    blocks, expected = [], []
+    for i in range(4):  # heterogeneous: PD, indefinite, PD, indefinite
+        A = rng.standard_normal((n, n))
+        A = A + A.T + (n if i % 2 == 0 else 0.0) * np.eye(n)
+        eigs = np.linalg.eigvalsh(A)
+        expected.append([int((eigs > 0).sum()), int((eigs < 0).sum())])
+        blocks.append(A)
+    assert expected[0] != expected[1]
+
+    mask = np.triu(np.ones((n, n), dtype=bool))
+    columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
+    offsets = jnp.asarray(
+        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
+    vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks]))
+
+    @jax.jit
+    @jax.vmap
+    def per_block(v):
+        t = cudss.analyze(v, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, v)
+        data = cudss.query(t)
+        return cudss.inertia(data), data["diag"], data["lu_nnz"]
+
+    inr, diag, lu_nnz = per_block(vals)
+    np.testing.assert_array_equal(np.asarray(inr), expected)
+    assert diag.shape == (4, n)  # input-ordered field: split per block
+    # diag is the LDL^T D in input order — sign pattern per block, not the
+    # matrix diagonal; sanity-check block attribution via the sign counts
+    assert lu_nnz.shape == (4, 1)  # block-global field: broadcast
+    assert len(set(np.asarray(lu_nnz).ravel().tolist())) == 1
+
+
 # error handling ===============================================================
 def test_solve_before_factorize_raises():
     _require_gpu()
