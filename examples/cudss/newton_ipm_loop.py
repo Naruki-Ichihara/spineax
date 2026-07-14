@@ -21,7 +21,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def make_kkt_batch(n_x=60, n_c=20, batch_size=16, seed=0):
@@ -82,17 +82,17 @@ def main():
     vals = values(rho)
 
     # 1. analyze ONCE: one block-diagonal entry for the whole batch
-    token = tk.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
+    token = cudss.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
     # 2. first factorization (fresh pivoting)
-    token = tk.factorize(token, vals)
+    token = cudss.factorize(token, vals)
 
-    factorize_j = jax.jit(tk.factorize)
-    solve_j = jax.jit(tk.solve)
+    factorize_j = jax.jit(cudss.factorize)
+    solve_j = jax.jit(cudss.solve)
 
     print(f"batch of {batch_size} KKT systems, n = {n_x + n_c}, expected inertia ({n_x}, {n_c})")
     for it in range(4):
         # 3. per-block inertia BEFORE solving (the one data door)
-        inertia = tk.inertia(tk.query(token), batch_size=batch_size)
+        inertia = cudss.inertia(cudss.query(token), batch_size=batch_size)
         wrong = jnp.any(inertia != expected[None, :], axis=1)
         n_wrong = int(wrong.sum())
         print(f"iter {it}: {n_wrong}/{batch_size} blocks with wrong inertia"
@@ -124,11 +124,11 @@ def main():
     def step(token, vals, b, needs_refactor):
         token = jax.lax.cond(
             needs_refactor,
-            lambda t: tk.refactorize(t, vals),
+            lambda t: cudss.refactorize(t, vals),
             lambda t: t,
             token,
         )
-        return tk.solve(token, b), token
+        return cudss.solve(token, b), token
 
     x2, token = step(token, vals, b, False)   # skip branch: reuse factors
     x3, token = step(token, vals, b, True)    # take branch: fresh refactorization

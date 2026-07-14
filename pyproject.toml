@@ -15,6 +15,7 @@ authors = [
 dependencies = [
     "jaxtyping",
     "equinox",
+    "lineax",
 ]
 
 [project.optional-dependencies]
@@ -38,14 +39,9 @@ testpaths = [
 ]
 
 [tool.scikit-build.sdist]
-include = ["src/spineax/**", "CMakeLists.txt", "src/**/*.cpp", "src/**/*.cu"]
+include = ["spineax/**", "CMakeLists.txt"]
 
 [tool.scikit-build]
 minimum-version = "0.5"
 build-dir = "build/{wheel_tag}"
 editable.rebuild = true
-
-[tool.setuptools.packages.find]
-where = [
-    "src"
-]

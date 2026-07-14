@@ -7,7 +7,7 @@ config), and you take what you need — e.g. inertia(data) for the per-block
 """
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 def test_outputs():
 
@@ -30,11 +30,11 @@ def test_outputs():
     csr_offsets1, csr_columns1, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
 
     # upper triangular view of a symmetric matrix
-    token = tk.analyze(csr_values1, csr_offsets1, csr_columns1, mtype_id=1, mview_id=1)
-    token = tk.factorize(token, csr_values1)
-    x = tk.solve(token, b1)
+    token = cudss.analyze(csr_values1, csr_offsets1, csr_columns1, mtype_id=1, mview_id=1)
+    token = cudss.factorize(token, csr_values1)
+    x = cudss.solve(token, b1)
 
-    data = tk.query(token)
+    data = cudss.query(token)
 
     # check out the values of the various things!
     print(f"x: {x} (max err vs dense: {jnp.max(jnp.abs(x - true_x1)):.2e})")
@@ -54,6 +54,6 @@ def test_outputs():
     print(f"schur_shape (disabled by default): {data['schur_shape']}")
 
     # spineax's per-block LDL^T inertia, sign counts of the block-aligned diag
-    print(f"inertia (spineax, per-block from diag): {tk.inertia(data)}")
+    print(f"inertia (spineax, per-block from diag): {cudss.inertia(data)}")
 
 test_outputs()

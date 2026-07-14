@@ -13,7 +13,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def make_spd_system(n=200, cond=1e12, seed=0):
@@ -52,15 +52,15 @@ def test_single_vs_batch():
     offsets, columns, values, b, x_true = make_spd_system()
 
     # single entry
-    token = tk.analyze(values, offsets, columns, mtype_id=3, mview_id=1)
-    token = tk.factorize(token, values)
+    token = cudss.analyze(values, offsets, columns, mtype_id=3, mview_id=1)
+    token = cudss.factorize(token, values)
 
     # one block-diagonal entry for a batch of 4 copies
     batch_size = 4
     vals_batch = jnp.stack([values] * batch_size)
     b_batch = jnp.stack([b] * batch_size)
-    btoken = tk.analyze(vals_batch, offsets, columns, mtype_id=3, mview_id=1)
-    btoken = tk.factorize(btoken, vals_batch)
+    btoken = cudss.analyze(vals_batch, offsets, columns, mtype_id=3, mview_id=1)
+    btoken = cudss.factorize(btoken, vals_batch)
 
     # Note: with ir_nsteps > 0 the batch elements are NOT bitwise identical
     # even though the blocks are copies — IR runs one global refinement over
@@ -70,10 +70,10 @@ def test_single_vs_batch():
     print(f"  {'-'*6}  |  {'-'*12}  |  {'-'*12}  |  {'-'*12}")
 
     for nsteps in [0, 1, 2, 5, 10, 20]:
-        x_single = tk.solve(token, b, ir_nsteps=nsteps)
+        x_single = cudss.solve(token, b, ir_nsteps=nsteps)
         err_single = float(jnp.linalg.norm(x_single - x_true) / jnp.linalg.norm(x_true))
 
-        x_batch = tk.solve(btoken, b_batch, ir_nsteps=nsteps)
+        x_batch = cudss.solve(btoken, b_batch, ir_nsteps=nsteps)
         err_batch = float(jnp.linalg.norm(x_batch[0] - x_true) / jnp.linalg.norm(x_true))
 
         spread = max(
@@ -82,8 +82,8 @@ def test_single_vs_batch():
         )
         print(f"  {nsteps:>6}  |  {err_single:>12.2e}  |  {err_batch:>12.2e}  |  {spread:>12.2e}")
 
-    tk.release(token)
-    tk.release(btoken)
+    cudss.release(token)
+    cudss.release(btoken)
     print()
 
 
@@ -97,10 +97,10 @@ def test_ir_respected_in_jit():
 
     @jax.jit
     def solve_both(values, b):
-        token = tk.analyze(values, offsets, columns, mtype_id=3, mview_id=1)
-        token = tk.factorize(token, values)
-        x_0 = tk.solve(token, b, ir_nsteps=0)
-        x_20 = tk.solve(token, b, ir_nsteps=20)
+        token = cudss.analyze(values, offsets, columns, mtype_id=3, mview_id=1)
+        token = cudss.factorize(token, values)
+        x_0 = cudss.solve(token, b, ir_nsteps=0)
+        x_20 = cudss.solve(token, b, ir_nsteps=20)
         return x_0, x_20
 
     x_0, x_20 = solve_both(values, b)

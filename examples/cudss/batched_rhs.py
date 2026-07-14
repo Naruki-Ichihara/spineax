@@ -7,7 +7,7 @@ solve many. The same fast path fires under jax.vmap with an unbatched token.
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 def test_batched_rhs():
     # Single matrix A
@@ -36,14 +36,14 @@ def test_batched_rhs():
     csr_offsets, csr_columns, csr_values = LHS.indptr, LHS.indices, LHS.data
 
     # Factor ONCE
-    token = tk.analyze(csr_values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
-    token = tk.factorize(token, csr_values)
+    token = cudss.analyze(csr_values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+    token = cudss.factorize(token, csr_values)
 
     # One multi-RHS SOLVE for the whole stack
-    x_batch = tk.solve(token, b_batch)
+    x_batch = cudss.solve(token, b_batch)
 
     # ... and the identical vmap form (same single cuDSS call underneath)
-    x_vmap = jax.vmap(lambda b: tk.solve(token, b))(b_batch)
+    x_vmap = jax.vmap(lambda b: cudss.solve(token, b))(b_batch)
 
     print(f"Batch size: {b_batch.shape[0]}")
     print(f"Solution shape: {x_batch.shape}")

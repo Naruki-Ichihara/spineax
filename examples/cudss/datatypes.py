@@ -2,7 +2,7 @@
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 jax.config.update("jax_enable_x64", True)
 
 def test_datatypes(dtype):
@@ -26,10 +26,10 @@ def test_datatypes(dtype):
     csr_offsets1, csr_columns1, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
 
     # full symmetric matrix passed in, full view
-    token = tk.analyze(csr_values1, csr_offsets1, csr_columns1, mtype_id=1, mview_id=0)
-    token = tk.factorize(token, csr_values1)
-    x = tk.solve(token, b1)
-    inertia = tk.inertia(tk.query(token))
+    token = cudss.analyze(csr_values1, csr_offsets1, csr_columns1, mtype_id=1, mview_id=0)
+    token = cudss.factorize(token, csr_values1)
+    x = cudss.solve(token, b1)
+    inertia = cudss.inertia(cudss.query(token))
 
     # check out the values of the various things!
     print(f"x: {x}")

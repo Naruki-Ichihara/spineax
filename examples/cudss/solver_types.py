@@ -1,7 +1,7 @@
 """Example: all five cuDSS matrix types through the token API."""
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def test_solver_types(mtype_id):
@@ -25,10 +25,10 @@ def test_solver_types(mtype_id):
     csr_offsets1, csr_columns1, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
 
     # we are passing the whole LHS matrix in FULL (mview_id=0), on GPU 0
-    token = tk.analyze(csr_values1, csr_offsets1, csr_columns1,
+    token = cudss.analyze(csr_values1, csr_offsets1, csr_columns1,
                        mtype_id=mtype_id, mview_id=0, device_id=0)
-    token = tk.factorize(token, csr_values1)
-    x = tk.solve(token, b1)
+    token = cudss.factorize(token, csr_values1)
+    x = cudss.solve(token, b1)
 
     # check out the values of the various things!
     print(f"x: {x}")

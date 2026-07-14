@@ -7,7 +7,7 @@ single registry entry and every downstream phase is one batched call.
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def test_composability():
@@ -37,9 +37,9 @@ def test_composability():
     b = jnp.vstack([b1, b2])
 
     def token_solve(values, b):
-        token = tk.analyze(values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
-        token = tk.factorize(token, values)
-        return tk.solve(token, b)
+        token = cudss.analyze(values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+        token = cudss.factorize(token, values)
+        return cudss.solve(token, b)
 
     # single solve, eager
     x1 = token_solve(csr_values[0], b[0])

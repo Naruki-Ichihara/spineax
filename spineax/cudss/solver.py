@@ -9,11 +9,15 @@ Four free functions mapping 1:1 onto cuDSS phases, plus one data door:
     data  = query(token)          # every cuDSS data item, unconditionally
     inr   = inertia(data, batch_size)  # per-block [pos, neg] from that data
 
-The ``FactorToken`` is a pytree with one traced ``int32`` leaf (the registry
-id) plus static metadata. The traced id gives XLA a data dependency ordering
-every call after the one that produced its token, threads through
-``custom_vjp`` residuals so an adjoint can reuse the forward factorization, and
-passes unchanged through ``jit``/``grad``/``vmap``/``lax.scan``/``lax.cond``.
+The ``FactorToken`` is a pytree: the traced ``int32`` registry id (dataflow
+ordering, ``custom_vjp`` residuals, vmap batching) plus ZERO-COPY references
+to the caller's CSR arrays (``values``/``offsets``/``columns``) and static
+metadata. Holding the CSR arrays in the token keeps them alive exactly as
+long as the factorization they produced, and every phase call passes them to
+the FFI so cuDSS only ever reads live XLA buffers — no device-side copies
+anywhere (design doc step 10). ``values`` is updated by ``factorize`` /
+``refactorize``, so solve-time iterative refinement provably refines against
+the matrix that produced the factors.
 
 Batching is always block-diagonal: a batch of B systems IS one bigger sparse
 system, and a single system is the B=1 special case, all served by the
@@ -31,9 +35,9 @@ from ``SPINEAX_FACTOR_CACHE``, default 8); using an evicted token raises at
 runtime. ``release(token)`` frees an entry eagerly (outside jit only).
 
 Inertia (per-block positive/negative eigenvalue counts from the LDL^T
-diagonal) is a property of the factorization, so it is returned by
-``factorize`` / ``refactorize`` — an IPM can inspect it before paying for a
-solve.
+diagonal) is a property of the factorization: ``query`` the token after
+``factorize`` / ``refactorize`` and pass the result to ``inertia`` — an IPM
+can inspect it before paying for a solve.
 """
 
 import dataclasses
@@ -41,7 +45,10 @@ from functools import lru_cache
 
 import equinox as eqx
 import jax
+import jax.experimental.sparse as jsparse
+import jax.flatten_util as jfu
 import jax.numpy as jnp
+import lineax as lx
 from jaxtyping import Array
 
 # Force JAX to initialize the CUDA context before importing the native module.
@@ -51,10 +58,11 @@ try:
     from spineax import pbatch_solve as _ps  # native nanobind module
 except ImportError as e:
     raise ImportError(
-        "spineax.cudss.tokens requires the pbatch_solve native module "
-        "(built when BUILD_PBATCH_SOLVE is enabled): the token API treats a "
-        "single solve as the batch_size=1 case of the block-diagonal batch "
-        "construction, which lives there."
+        "spineax.cudss.solver requires the pbatch_solve native module: the "
+        "token API treats a single solve as the batch_size=1 case of the "
+        "block-diagonal batch construction, which lives there. Was the "
+        "package built with its CUDA extension (pip install with CUDA "
+        "toolkit + cuDSS >= 0.8 available)?"
     ) from e
 
 # registrations ================================================================
@@ -112,15 +120,24 @@ def compute_inertia_from_diag(diag, batch_size, matrix_dim):
 class FactorToken(eqx.Module):
     """Handle to a cached cuDSS (block-diagonal) factorization.
 
-    ``id`` is the only traced leaf: dataflow ordering, vjp residuals and vmap
-    batching all operate on it. It is ``int32[1]`` for a token minted outside
-    vmap, or ``int32[B, 1]`` (B equal copies of one entry id) for a token
-    minted by ``vmap(analyze)``. The static fields resolve dispatch at trace
-    time and make the token self-describing — including for a future lineax
-    adapter, where a FactorToken is the solver state.
+    ``id`` is the traced dispatch leaf: dataflow ordering, vjp residuals and
+    vmap batching all operate on it. It is ``int32[1]`` for a token minted
+    outside vmap, or ``int32[B, 1]`` (B equal copies of one entry id) for a
+    token minted by ``vmap(analyze)``.
+
+    ``values``/``offsets``/``columns`` are zero-copy references to the
+    caller's CSR arrays (the block pattern exactly as handed to ``analyze``,
+    NOT the expanded block-diagonal form). They keep the CSR data alive as
+    long as the factorization and are passed to every phase call so cuDSS
+    always reads live buffers; ``values`` is the values of the last numeric
+    phase. The static fields resolve dispatch at trace time and make the
+    token self-describing — a FactorToken is directly a lineax solver state.
     """
 
     id: Array                                # int32[1] or int32[B, 1] — traced
+    values: Array                            # (nnz,) or (B, nnz)
+    offsets: Array                           # int32 (n+1,) or (B, n+1)
+    columns: Array                           # int32 (nnz,) or (B, nnz)
     kind: str = eqx.field(static=True)       # "single" | "pbatch" (descriptive)
     dtype: jnp.dtype = eqx.field(static=True)
     n: int = eqx.field(static=True)          # BLOCK dimension (one system)
@@ -131,8 +148,62 @@ class FactorToken(eqx.Module):
     device_id: int = eqx.field(static=True)
 
 
-def _with_id(token: FactorToken, new_id: Array) -> FactorToken:
-    return dataclasses.replace(token, id=new_id)
+def _advance(token: FactorToken, new_id: Array, new_values: Array) -> FactorToken:
+    """Thread the token forward through a numeric phase: same entry id
+    (dataflow-ordered), values leaf swapped to the just-factorized values."""
+    return dataclasses.replace(token, id=new_id, values=new_values)
+
+
+def _structure_fingerprint(offsets_bd, columns_bd):
+    """Position-weighted checksum (uint32[2]) of the expanded structure.
+
+    The token's offsets/columns leaves are IMMUTABLE by contract — cuDSS's
+    analysis and pivot order are tied to the pattern that was analyzed, so a
+    swapped same-sized pattern would silently produce garbage factors. The
+    fingerprint is computed on-device in the same pass that reads the
+    structure anyway, and every phase handler compares it (8 bytes on the
+    host) against the value stored at analysis — full content verification
+    at zero-copy cost. Position weights make permuted contents distinct.
+    """
+    w_off = jnp.arange(offsets_bd.shape[0], dtype=jnp.uint32) * jnp.uint32(
+        2654435761) + jnp.uint32(0x9E3779B9)
+    w_col = jnp.arange(columns_bd.shape[0], dtype=jnp.uint32) * jnp.uint32(
+        2246822519) + jnp.uint32(0x85EBCA6B)
+    h_off = jnp.sum((offsets_bd.astype(jnp.uint32) + jnp.uint32(1)) * w_off,
+                    dtype=jnp.uint32)
+    h_col = jnp.sum((columns_bd.astype(jnp.uint32) + jnp.uint32(1)) * w_col,
+                    dtype=jnp.uint32)
+    return jnp.stack([h_off, h_col])
+
+
+def _expand_structure(offsets, columns, batch_size):
+    """Block-diagonal CSR structure + fingerprint from a block pattern.
+
+    ``offsets``/``columns`` are ``(n+1,)``/``(nnz,)`` for one shared pattern
+    or ``(B, n+1)``/``(B, nnz)`` for per-block patterns; the result is the
+    expanded ``(B*n + 1,)``/``(B*nnz,)`` int32 structure of the one big
+    block-diagonal system plus its fingerprint. B=1 passes the arrays
+    through untouched (zero-copy). The expansion is an elementwise int add —
+    bandwidth-trivial, XLA-temporary — recomputed per phase call instead of
+    persisting in device memory; the fingerprint rides the same pass.
+    """
+    offsets = offsets.astype(jnp.int32)
+    columns = columns.astype(jnp.int32)
+    if batch_size == 1:
+        offsets_bd = offsets.reshape(-1)
+        columns_bd = columns.reshape(-1)
+        return offsets_bd, columns_bd, _structure_fingerprint(offsets_bd,
+                                                              columns_bd)
+    n = offsets.shape[-1] - 1
+    nnz = columns.shape[-1]
+    shift = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
+    offs_2d = offsets if offsets.ndim == 2 else offsets[None, :]
+    cols_2d = columns if columns.ndim == 2 else columns[None, :]
+    body = (offs_2d[:, 1:] + shift * jnp.int32(nnz)).reshape(-1)
+    offsets_bd = jnp.concatenate([jnp.zeros((1,), jnp.int32), body])
+    columns_bd = (cols_2d + shift * jnp.int32(n)).reshape(-1)
+    return offsets_bd, columns_bd, _structure_fingerprint(offsets_bd,
+                                                          columns_bd)
 
 
 def _as_ir(ir_nsteps) -> Array:
@@ -154,7 +225,9 @@ def _batch_of(token: FactorToken) -> int:
 
 
 # raw FFI calls ================================================================
-def _ffi_analyze(values, offsets, columns, *, batch_size, pattern_batched,
+# Every call hands the (expanded) structure and values over as arguments, so
+# cuDSS reads live XLA buffers only — the entry owns no CSR data (zero-copy).
+def _ffi_analyze(values, offsets_bd, columns_bd, fingerprint, *, batch_size,
                  device_id, mtype_id, mview_id):
     fn = jax.ffi.ffi_call(
         f"spineax_token_analyze_{_suffix(values.dtype)}",
@@ -163,32 +236,33 @@ def _ffi_analyze(values, offsets, columns, *, batch_size, pattern_batched,
     )
     return fn(
         values,
-        offsets.astype(jnp.int32),
-        columns.astype(jnp.int32),
+        offsets_bd,
+        columns_bd,
+        fingerprint,
         batch_size=batch_size,
-        pattern_batched=pattern_batched,
         device_id=device_id,
         mtype_id=mtype_id,
         mview_id=mview_id,
     )
 
 
-def _ffi_numeric(token_id, values, ir, *, op):
+def _ffi_numeric(token_id, offsets_bd, columns_bd, fingerprint, values, ir,
+                 *, op):
     fn = jax.ffi.ffi_call(
         f"spineax_token_{op}_{_suffix(values.dtype)}",
         jax.ShapeDtypeStruct(token_id.shape, jnp.int32),  # token (same ids)
         has_side_effect=True,
     )
-    return fn(token_id, values, ir)
+    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, ir)
 
 
-def _ffi_solve(token_id, b, ir):
+def _ffi_solve(token_id, offsets_bd, columns_bd, fingerprint, values, b, ir):
     fn = jax.ffi.ffi_call(
         f"spineax_token_solve_{_suffix(b.dtype)}",
         jax.ShapeDtypeStruct(b.shape, b.dtype),
         has_side_effect=True,
     )
-    return fn(token_id, b, ir)
+    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, b, ir)
 
 
 # vmap-aware wrappers over the single (B=1) view ===============================
@@ -201,8 +275,9 @@ def _make_analyze(suffix, device_id, mtype_id, mview_id):
 
     @jax.custom_batching.custom_vmap
     def analyze_id(csr_values, csr_offsets, csr_columns):
-        return _ffi_analyze(csr_values, csr_offsets, csr_columns,
-                            batch_size=1, pattern_batched=0,
+        offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns, 1)
+        return _ffi_analyze(csr_values, offs_bd, cols_bd, fp,
+                            batch_size=1,
                             device_id=device_id, mtype_id=mtype_id,
                             mview_id=mview_id)
 
@@ -211,19 +286,13 @@ def _make_analyze(suffix, device_id, mtype_id, mview_id):
         # A batch of systems is ONE block-diagonal system: mint one entry and
         # broadcast its id across the batch. (Unbatched inputs never reach
         # this rule — JAX hoists them out of vmap.)
-        vb, ob, cb = in_batched
+        vb, _, _ = in_batched
         vals = csr_values if vb else jnp.broadcast_to(
             csr_values, (axis_size,) + csr_values.shape)
-        pattern_batched = ob or cb
-        offs, cols = csr_offsets, csr_columns
-        if pattern_batched:  # per-block patterns: materialize both batched
-            if not ob:
-                offs = jnp.broadcast_to(offs, (axis_size,) + offs.shape)
-            if not cb:
-                cols = jnp.broadcast_to(cols, (axis_size,) + cols.shape)
-        token_id = _ffi_analyze(vals, offs, cols,
+        offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns,
+                                                 axis_size)
+        token_id = _ffi_analyze(vals, offs_bd, cols_bd, fp,
                                 batch_size=axis_size,
-                                pattern_batched=int(pattern_batched),
                                 device_id=device_id, mtype_id=mtype_id,
                                 mview_id=mview_id)
         return jnp.broadcast_to(token_id, (axis_size, 1)), True
@@ -237,12 +306,14 @@ def _make_numeric(suffix, refactor):
     del suffix
 
     @jax.custom_batching.custom_vmap
-    def numeric_id(token_id, csr_values, ir):
-        return _ffi_numeric(token_id, csr_values, ir, op=op)
+    def numeric_id(token_id, offsets, columns, csr_values, ir):
+        offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
+        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, csr_values, ir,
+                            op=op)
 
     @numeric_id.def_vmap
-    def _(axis_size, in_batched, token_id, csr_values, ir):
-        tb, vb, ib = in_batched
+    def _(axis_size, in_batched, token_id, offsets, columns, csr_values, ir):
+        tb, _, _, vb, ib = in_batched
         if ib:
             raise ValueError(
                 f"spineax tokens: ir_nsteps cannot vary across a batched "
@@ -254,7 +325,9 @@ def _make_numeric(suffix, refactor):
                 "factorizations. vmap(analyze) over the batch first.")
         vals = csr_values if vb else jnp.broadcast_to(
             csr_values, (axis_size,) + csr_values.shape)
-        return _ffi_numeric(token_id, vals, ir, op=op), True
+        offs_bd, cols_bd, fp = _expand_structure(offsets, columns, axis_size)
+        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, vals, ir,
+                            op=op), True
 
     return numeric_id
 
@@ -264,12 +337,13 @@ def _make_solve(suffix):
     del suffix
 
     @jax.custom_batching.custom_vmap
-    def solve_id(token_id, b_values, ir):
-        return _ffi_solve(token_id, b_values, ir)
+    def solve_id(token_id, offsets, columns, values, b_values, ir):
+        offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
+        return _ffi_solve(token_id, offs_bd, cols_bd, fp, values, b_values, ir)
 
     @solve_id.def_vmap
-    def _(axis_size, in_batched, token_id, b_values, ir):
-        _, bb, ib = in_batched
+    def _(axis_size, in_batched, token_id, offsets, columns, values, b_values, ir):
+        tb, _, _, vb, bb, ib = in_batched
         if ib:
             raise ValueError(
                 "spineax tokens: ir_nsteps cannot vary across a batched solve")
@@ -278,7 +352,15 @@ def _make_solve(suffix):
         # One call either way, courtesy of the layout identities:
         # - unbatched token (one entry, N=n) + (B, n) rhs -> one multi-RHS SOLVE;
         # - batched ids (one block entry, N=B*n) + (B, n) rhs -> one block SOLVE.
-        return _ffi_solve(token_id, b, ir), True
+        if tb:
+            offs_bd, cols_bd, fp = _expand_structure(offsets, columns,
+                                                     axis_size)
+            vals = values if vb else jnp.broadcast_to(
+                values, (axis_size,) + values.shape)
+        else:
+            offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
+            vals = values
+        return _ffi_solve(token_id, offs_bd, cols_bd, fp, vals, b, ir), True
 
     return solve_id
 
@@ -288,9 +370,9 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
             mtype_id=1, mview_id=1, device_id=0) -> FactorToken:
     """Run cuDSS ANALYSIS (reordering, elimination tree) on a CSR system.
 
-    Creates a registry entry owning private device copies of the (expanded)
-    CSR structure and returns an *analyzed* ``FactorToken``. Call ``factorize``
-    before ``solve``.
+    Creates a registry entry (cuDSS handles + factors only — the CSR arrays
+    stay the caller's, referenced zero-copy by the returned *analyzed*
+    ``FactorToken``). Call ``factorize`` before ``solve``.
 
     Parameters
     ----------
@@ -308,27 +390,33 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
     hoisted out and analyzed once.
     """
     dtype = jnp.dtype(csr_values.dtype)
+    csr_offsets = csr_offsets.astype(jnp.int32)
+    csr_columns = csr_columns.astype(jnp.int32)
+    n = csr_offsets.shape[-1] - 1
+    nnz = csr_columns.shape[-1]
     if csr_values.ndim == 2:
         # explicit block-diagonal batch door
-        batch_size, nnz = csr_values.shape
-        n = csr_offsets.shape[-1] - 1
-        pattern_batched = int(csr_offsets.ndim == 2 or csr_columns.ndim == 2)
+        batch_size = csr_values.shape[0]
+        offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns,
+                                                 int(batch_size))
         token_id = _ffi_analyze(
-            csr_values, csr_offsets, csr_columns,
-            batch_size=int(batch_size), pattern_batched=pattern_batched,
+            csr_values, offs_bd, cols_bd, fp,
+            batch_size=int(batch_size),
             device_id=int(device_id), mtype_id=int(mtype_id),
             mview_id=int(mview_id))
         return FactorToken(
-            id=token_id, kind="pbatch", dtype=dtype, n=int(n), nnz=int(nnz),
+            id=token_id, values=csr_values, offsets=csr_offsets,
+            columns=csr_columns,
+            kind="pbatch", dtype=dtype, n=int(n), nnz=int(nnz),
             batch_size=int(batch_size), mtype_id=int(mtype_id),
             mview_id=int(mview_id), device_id=int(device_id))
-    n = csr_offsets.shape[-1] - 1
-    nnz = csr_columns.shape[-1]
     token_id = _make_analyze(
         _suffix(dtype), int(device_id), int(mtype_id), int(mview_id)
     )(csr_values, csr_offsets, csr_columns)
     return FactorToken(
-        id=token_id, kind="single", dtype=dtype, n=int(n), nnz=int(nnz),
+        id=token_id, values=csr_values, offsets=csr_offsets,
+        columns=csr_columns,
+        kind="single", dtype=dtype, n=int(n), nnz=int(nnz),
         batch_size=1, mtype_id=int(mtype_id), mview_id=int(mview_id),
         device_id=int(device_id))
 
@@ -353,12 +441,15 @@ def _numeric(token, csr_values, ir_nsteps, refactor):
             raise ValueError(
                 f"spineax tokens: {op} on a batch token expects values "
                 f"({B}, {token.nnz}), got {csr_values.shape}")
-        token_id = _ffi_numeric(token.id, csr_values, ir, op=op)
-        return _with_id(token, token_id)
+        offs_bd, cols_bd, fp = _expand_structure(token.offsets,
+                                                 token.columns, B)
+        token_id = _ffi_numeric(token.id, offs_bd, cols_bd, fp, csr_values,
+                                ir, op=op)
+        return _advance(token, token_id, csr_values)
 
     token_id = _make_numeric(_suffix(token.dtype), refactor)(
-        token.id, csr_values, ir)
-    return _with_id(token, token_id)
+        token.id, token.offsets, token.columns, csr_values, ir)
+    return _advance(token, token_id, csr_values)
 
 
 def factorize(token: FactorToken, csr_values, ir_nsteps=None) -> FactorToken:
@@ -404,9 +495,12 @@ def solve(token: FactorToken, b, ir_nsteps=None):
             raise ValueError(
                 f"spineax tokens: solve on a batch token expects rhs "
                 f"(..., {B}, {token.n}), got {b.shape}")
-        return _ffi_solve(token.id, b, ir)
+        offs_bd, cols_bd, fp = _expand_structure(token.offsets,
+                                                 token.columns, B)
+        return _ffi_solve(token.id, offs_bd, cols_bd, fp, token.values, b, ir)
 
-    return _make_solve(_suffix(token.dtype))(token.id, b, ir)
+    return _make_solve(_suffix(token.dtype))(
+        token.id, token.offsets, token.columns, token.values, b, ir)
 
 
 _QUERY_FIELDS = (
@@ -494,3 +588,147 @@ def registry_size() -> int:
 def cache_capacity() -> int:
     """LRU capacity (``SPINEAX_FACTOR_CACHE``, default 8)."""
     return int(_ps.token_cache_capacity())
+
+
+# lineax front door — the default user-facing API =============================
+# An operator + solver pair over the token machinery above. lineax's protocol
+# (init/compute) drives it like any built-in solver, and the cuDSS phases are
+# ALSO explicit token-threading methods for full control (IPM/Newton loops).
+
+class CSRSymmetricOperator(lx.AbstractLinearOperator):
+    """A symmetric matrix in CSR form (full pattern, values as the one leaf).
+
+    Stores the FULL sparsity pattern (both triangles) so ``mv`` is a plain
+    BCSR matvec; cuDSS accepts a full view (``mview_id=0``) with a symmetric
+    mtype. The arrays are referenced zero-copy, same as everywhere else.
+    """
+
+    values: Array
+    offsets: Array
+    columns: Array
+
+    def _bcsr(self):
+        n = self.offsets.shape[0] - 1
+        return jsparse.BCSR((self.values, self.columns, self.offsets),
+                            shape=(n, n))
+
+    def mv(self, vector):
+        return self._bcsr() @ vector
+
+    def as_matrix(self):
+        return self._bcsr().todense()
+
+    def transpose(self):
+        return self  # symmetric
+
+    def in_structure(self):
+        n = self.offsets.shape[0] - 1
+        return jax.ShapeDtypeStruct((n,), self.values.dtype)
+
+    def out_structure(self):
+        return self.in_structure()
+
+
+# lineax dispatches these predicates by operator class
+@lx.is_symmetric.register(CSRSymmetricOperator)
+def _(operator):
+    return True
+
+
+@lx.linearise.register(CSRSymmetricOperator)
+@lx.materialise.register(CSRSymmetricOperator)
+def _(operator):
+    return operator
+
+
+@lx.conj.register(CSRSymmetricOperator)
+def _(operator):
+    return operator  # real-valued
+
+
+for _predicate in (lx.is_diagonal, lx.is_tridiagonal, lx.is_lower_triangular,
+                   lx.is_upper_triangular, lx.is_positive_semidefinite,
+                   lx.is_negative_semidefinite, lx.has_unit_diagonal):
+    _predicate.register(CSRSymmetricOperator)(lambda operator: False)
+
+
+class CuDSS(lx.AbstractLinearSolver):
+    """lineax front door for the token API (symmetric matrices).
+
+    lineax's phase boundary is operator-dependent vs vector-dependent work
+    (``lx.Cholesky.init`` runs ``cho_factor``; ``compute`` runs
+    ``cho_solve``), so the protocol slots follow that convention:
+
+        init    = analyze + factorize    (all operator-dependent work)
+        compute = solve                  (per-vector work only)
+
+    The state is the factorized token, so lineax's ``state=`` argument
+    means the same thing it means for every built-in solver: one
+    factorization, many right-hand sides.
+
+    Every un-stated ``lx.linear_solve`` call re-inits, minting a registry
+    entry whose cuDSS factors occupy device memory (the CSR arrays are
+    zero-copy references in the token, never duplicated). Outside jit, free
+    it eagerly with ``release(sol.state)``; under jit that is impossible
+    and the LRU (``SPINEAX_FACTOR_CACHE``, default 8) bounds the leak by
+    evicting oldest-used entries.
+
+    For true control the phases are explicit methods that thread tokens,
+    mirroring the ``spineax.cudss`` free functions with operator sugar:
+
+        solver = CuDSS()
+        token  = solver.analyze(operator)                 # ANALYSIS
+        token  = solver.factorize(token, operator)        # FACTORIZATION
+        token  = solver.refactorize(token, new_operator)  # REFACTORIZATION
+        x      = solver.solve(token, b)                   # SOLVE (repeatable)
+        data   = solver.query(token)                      # every cuDSS data item
+    """
+
+    mtype_id: int = eqx.field(static=True, default=1)
+    mview_id: int = eqx.field(static=True, default=0)
+
+    # explicit phases ----------------------------------------------------
+
+    def analyze(self, operator):
+        return analyze(operator.values, operator.offsets, operator.columns,
+                       mtype_id=self.mtype_id, mview_id=self.mview_id)
+
+    def factorize(self, token, operator):
+        return factorize(token, operator.values)
+
+    def refactorize(self, token, operator):
+        return refactorize(token, operator.values)
+
+    def solve(self, token, vector):
+        return solve(token, vector)
+
+    def query(self, token):
+        """Every cuDSS data item of this factorization, as one dict.
+
+        Same contract as the free function ``query``: everything returned
+        unconditionally (zero-filled where cuDSS declines), eager/outer
+        level. Derive what you need from it — e.g. per-block inertia via
+        ``inertia(solver.query(token), batch_size=B)``.
+        """
+        return query(token)
+
+    # lineax protocol ----------------------------------------------------
+
+    def init(self, operator, options):
+        del options
+        return self.factorize(self.analyze(operator), operator)
+
+    def compute(self, state, vector, options):
+        del options
+        vector, unflatten = jfu.ravel_pytree(vector)
+        solution = self.solve(state, vector)
+        return unflatten(solution), lx.RESULTS.successful, {}
+
+    def transpose(self, state, options):
+        return state, options  # symmetric: A^T shares the factorization
+
+    def conj(self, state, options):
+        return state, options  # real
+
+    def assume_full_rank(self):
+        return True

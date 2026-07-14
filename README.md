@@ -65,16 +65,9 @@ pip install --no-build-isolation "spineax[cuda12] @ git+ssh://git@github.com/joh
 ### Build fails with `__cudaGetKernel was not declared`
 
 This happens when your system's CUDA toolkit version doesn't match the pip-installed CUDA runtime.
-You can skip building the optional `pbatch_solve` module (builds by default):
-
-```bash
-# CUDA 12
-pip install "scikit-build-core>=0.5" nanobind "jax[cuda12]>=0.5.0" nvidia-cudss-cu12
-pip install --no-build-isolation --config-settings=cmake.args="-DBUILD_PBATCH_SOLVE=OFF" .[cuda12]
-
-# CUDA 13
-pip install "scikit-build-core>=0.5" nanobind "jax[cuda13]>=0.8.0" nvidia-cudss-cu13
-pip install --no-build-isolation --config-settings=cmake.args="-DBUILD_PBATCH_SOLVE=OFF" .[cuda13]
+The `pbatch_solve` native module is the whole cuDSS backend and cannot be skipped, so the fix is to
+build with a CUDA toolkit that matches the runtime major version of your `jax[cuda12]`/`jax[cuda13]`
+install (e.g. via an `nvidia/cuda` container of the right version).
 
 # Citation
 

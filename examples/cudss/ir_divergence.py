@@ -6,12 +6,12 @@ History (signal-era bug, see git history of ir_divergence_on_resolve.py):
     factorize -> solve(+IR)                       => correct
     factorize -> solve(+IR) -> new RHS solve(+IR) => IR diverged
 
-Root cause candidate: the old handlers rebound A's values pointer to the
-current (transient) XLA input buffer on every call, so IR's residual
-computation could read stale/reused memory on later solves. Token registry
-entries OWN a private copy of the values, refreshed only by
-factorize/refactorize — so re-solves always compute residuals against the
-matrix that was actually factorized.
+Root cause candidate: the old handlers left A's values pointer aimed at a
+previous call's (transient) XLA input buffer, so IR's residual computation
+could read stale/reused memory on later solves. The token carries the
+last-factorized values as a pytree leaf and hands them to EVERY solve call
+as a live buffer (zero-copy, design doc step 10) — so re-solves always
+compute residuals against the matrix that was actually factorized.
 
 This example re-runs the original reproducer through the token API on a
 well-conditioned SPD system and a KKT (symmetric indefinite) system, and
@@ -26,7 +26,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
 import numpy as np
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def make_spd_system(n, seed=0):
@@ -81,10 +81,10 @@ def run_resolve(name, A_full, b1, b2, x_true_1, x_true_2, mtype_id):
     print(f"  {'ir':>4}  {'err(b1)':>10}  {'err(b2, re-solve)':>18}")
     print(f"  {'-'*4}  {'-'*10}  {'-'*18}")
     for ir in [0, 5, 20]:
-        token = tk.analyze(values, offsets, columns, mtype_id=mtype_id, mview_id=1)
-        token = tk.factorize(token, values)
-        x1 = tk.solve(token, b1, ir_nsteps=ir)
-        x2 = tk.solve(token, b2, ir_nsteps=ir)  # the historically-divergent call
+        token = cudss.analyze(values, offsets, columns, mtype_id=mtype_id, mview_id=1)
+        token = cudss.factorize(token, values)
+        x1 = cudss.solve(token, b1, ir_nsteps=ir)
+        x2 = cudss.solve(token, b2, ir_nsteps=ir)  # the historically-divergent call
         err1 = float(jnp.linalg.norm(x1 - x_true_1) / jnp.linalg.norm(x_true_1))
         err2 = float(jnp.linalg.norm(x2 - x_true_2) / jnp.linalg.norm(x_true_2))
         # divergence = the RE-solve being wildly worse than the first solve
@@ -92,7 +92,7 @@ def run_resolve(name, A_full, b1, b2, x_true_1, x_true_2, mtype_id):
         # baseline accuracy at this ir setting
         flag = "  <-- re-solve diverged!" if err2 > 1e3 * max(err1, 1e-14) else ""
         print(f"  {ir:>4}  {err1:>10.2e}  {err2:>18.2e}{flag}")
-        tk.release(token)
+        cudss.release(token)
     print()
 
 

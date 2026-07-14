@@ -7,7 +7,7 @@ import pytest
 
 jax.config.update("jax_enable_x64", True)
 
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def _require_gpu():
@@ -73,15 +73,15 @@ def test_analyze_factorize_solve(dtype):
     values, offsets, columns, A = _sym_system(dtype=dtype)
     b = jnp.asarray(np.random.default_rng(2).standard_normal(A.shape[0]), dtype=dtype)
 
-    token = tk.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+    token = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
     assert token.kind == "single"
     assert token.n == A.shape[0]
 
-    token = tk.factorize(token, values)
-    inertia = tk.inertia(tk.query(token))
+    token = cudss.factorize(token, values)
+    inertia = cudss.inertia(cudss.query(token))
     np.testing.assert_array_equal(np.asarray(inertia), [A.shape[0], 0])  # PD
 
-    x = tk.solve(token, b)
+    x = cudss.solve(token, b)
     assert _rel_err(A, x, b) < _TOL[dtype]
 
 
@@ -94,9 +94,9 @@ def test_complex_general(dtype):
         + 1j * np.random.default_rng(4).standard_normal(A.shape[0]),
         dtype=dtype,
     )
-    token = tk.analyze(values, offsets, columns, mtype_id=0, mview_id=0)
-    token = tk.factorize(token, values)
-    x = tk.solve(token, b)
+    token = cudss.analyze(values, offsets, columns, mtype_id=0, mview_id=0)
+    token = cudss.factorize(token, values)
+    x = cudss.solve(token, b)
     assert _rel_err(A, x, b) < _TOL[dtype]
 
 
@@ -107,9 +107,9 @@ def test_jit_full_chain():
 
     @jax.jit
     def full(values, b):
-        t = tk.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
-        t = tk.factorize(t, values)
-        return tk.solve(t, b), tk.inertia(tk.query(t))
+        t = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, values)
+        return cudss.solve(t, b), cudss.inertia(cudss.query(t))
 
     x, inertia = full(values, b)
     assert _rel_err(A, x, b) < 1e-10
@@ -121,12 +121,12 @@ def test_refactorize():
     values, offsets, columns, A = _sym_system()
     b = jnp.asarray(np.random.default_rng(6).standard_normal(A.shape[0]))
 
-    token = tk.analyze(values, offsets, columns)
-    token = tk.factorize(token, values)
-    token = tk.refactorize(token, values * 2.0)
-    x = tk.solve(token, b)
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
+    token = cudss.refactorize(token, values * 2.0)
+    x = cudss.solve(token, b)
     assert _rel_err(2 * np.asarray(A), x, b) < 1e-10
-    inertia = tk.inertia(tk.query(token))
+    inertia = cudss.inertia(cudss.query(token))
     np.testing.assert_array_equal(np.asarray(inertia), [A.shape[0], 0])
 
 
@@ -136,9 +136,9 @@ def test_multirhs_stack():
     values, offsets, columns, A = _sym_system()
     B = jnp.asarray(np.random.default_rng(7).standard_normal((6, A.shape[0])))
 
-    token = tk.analyze(values, offsets, columns)
-    token = tk.factorize(token, values)
-    X = tk.solve(token, B)  # one multi-RHS SOLVE
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
+    X = cudss.solve(token, B)  # one multi-RHS SOLVE
     for i in range(B.shape[0]):
         assert _rel_err(A, X[i], B[i]) < 1e-10
 
@@ -148,10 +148,10 @@ def test_vmap_multirhs_fast_path():
     values, offsets, columns, A = _sym_system()
     B = jnp.asarray(np.random.default_rng(8).standard_normal((6, A.shape[0])))
 
-    token = tk.analyze(values, offsets, columns)
-    token = tk.factorize(token, values)
-    X_vmap = jax.vmap(lambda b: tk.solve(token, b))(B)
-    X_direct = tk.solve(token, B)
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
+    X_vmap = jax.vmap(lambda b: cudss.solve(token, b))(B)
+    X_direct = cudss.solve(token, B)
     np.testing.assert_allclose(np.asarray(X_vmap), np.asarray(X_direct), rtol=1e-14)
 
 
@@ -165,24 +165,24 @@ def test_vmap_batch_is_block_diagonal(monkeypatch):
     b = jnp.asarray(np.random.default_rng(9).standard_normal(A.shape[0]))
     b_batch = jnp.stack([b, b])
 
-    size_before = tk.registry_size()
-    tokens = jax.vmap(lambda v: tk.analyze(v, offsets, columns))(vals_batch)
+    size_before = cudss.registry_size()
+    tokens = jax.vmap(lambda v: cudss.analyze(v, offsets, columns))(vals_batch)
     # ONE block-diagonal entry, its id broadcast across the batch
     assert tokens.id.shape == (2, 1)
     ids = np.asarray(tokens.id)
     assert ids[0, 0] == ids[1, 0]
-    assert tk.registry_size() - size_before == 1
+    assert cudss.registry_size() - size_before == 1
 
-    tokens = jax.vmap(tk.factorize)(tokens, vals_batch)
-    inertias = tk.inertia(tk.query(tokens), batch_size=2)
+    tokens = jax.vmap(cudss.factorize)(tokens, vals_batch)
+    inertias = cudss.inertia(cudss.query(tokens), batch_size=2)
     np.testing.assert_array_equal(np.asarray(inertias), [[A.shape[0], 0]] * 2)
-    xs = jax.vmap(tk.solve)(tokens, b_batch)
+    xs = jax.vmap(cudss.solve)(tokens, b_batch)
     assert _rel_err(A, xs[0], b) < 1e-10
     assert _rel_err(3 * np.asarray(A), xs[1], b) < 1e-10
 
     # vmap-minted tokens work eagerly (outside vmap) too: batch-shaped args
-    tokens2 = tk.factorize(tokens, vals_batch * 2.0)
-    xs2 = tk.solve(tokens2, b_batch)
+    tokens2 = cudss.factorize(tokens, vals_batch * 2.0)
+    xs2 = cudss.solve(tokens2, b_batch)
     assert _rel_err(2 * np.asarray(A), xs2[0], b) < 1e-10
     assert _rel_err(6 * np.asarray(A), xs2[1], b) < 1e-10
 
@@ -192,20 +192,20 @@ def test_explicit_batch_door():
     values, offsets, columns, A = _sym_system()
     n = A.shape[0]
     vals = jnp.stack([values, values * 2.0, values * 5.0])
-    token = tk.analyze(vals, offsets, columns)
+    token = cudss.analyze(vals, offsets, columns)
     assert token.kind == "pbatch"
     assert token.batch_size == 3
-    token = tk.factorize(token, vals)
-    inertia = tk.inertia(tk.query(token), batch_size=3)
+    token = cudss.factorize(token, vals)
+    inertia = cudss.inertia(cudss.query(token), batch_size=3)
     np.testing.assert_array_equal(np.asarray(inertia), [[n, 0]] * 3)
 
     B = jnp.asarray(np.random.default_rng(20).standard_normal((3, n)))
-    X = tk.solve(token, B)
+    X = cudss.solve(token, B)
     for i, s in enumerate([1.0, 2.0, 5.0]):
         assert _rel_err(s * np.asarray(A), X[i], B[i]) < 1e-10
 
-    token = tk.refactorize(token, vals * 3.0)
-    X = tk.solve(token, B)
+    token = cudss.refactorize(token, vals * 3.0)
+    X = cudss.solve(token, B)
     for i, s in enumerate([3.0, 6.0, 15.0]):
         assert _rel_err(s * np.asarray(A), X[i], B[i]) < 1e-10
 
@@ -231,10 +231,10 @@ def test_vmap_batched_patterns():
         return A + A.T - np.diag(np.diag(A))
 
     cols_batch = jnp.stack([cols_a, cols_b])
-    tokens = jax.vmap(lambda c: tk.analyze(vals, offs, c))(cols_batch)
-    tokens = jax.vmap(lambda t: tk.factorize(t, vals))(tokens)
+    tokens = jax.vmap(lambda c: cudss.analyze(vals, offs, c))(cols_batch)
+    tokens = jax.vmap(lambda t: cudss.factorize(t, vals))(tokens)
     b = jnp.asarray(np.random.default_rng(21).standard_normal(n))
-    xs = jax.vmap(lambda t: tk.solve(t, b))(tokens)
+    xs = jax.vmap(lambda t: cudss.solve(t, b))(tokens)
     assert _rel_err(dense(cols_a), xs[0], b) < 1e-10
     assert _rel_err(dense(cols_b), xs[1], b) < 1e-10
 
@@ -242,10 +242,10 @@ def test_vmap_batched_patterns():
 def test_vmap_factorize_unbatched_token_raises():
     _require_gpu()
     values, offsets, columns, _ = _sym_system()
-    token = tk.analyze(values, offsets, columns)
+    token = cudss.analyze(values, offsets, columns)
     vals_batch = jnp.stack([values, values * 2.0])
     with pytest.raises(ValueError, match="vmap\\(analyze\\)"):
-        jax.vmap(lambda v: tk.factorize(token, v))(vals_batch)
+        jax.vmap(lambda v: cudss.factorize(token, v))(vals_batch)
 
 
 # control flow and autodiff ====================================================
@@ -258,14 +258,14 @@ def test_lax_cond_refactorize():
     def step(token, vals, b, do_refactor):
         token = jax.lax.cond(
             do_refactor,
-            lambda t: tk.refactorize(t, vals),
+            lambda t: cudss.refactorize(t, vals),
             lambda t: t,
             token,
         )
-        return tk.solve(token, b), token
+        return cudss.solve(token, b), token
 
-    token = tk.analyze(values, offsets, columns)
-    token = tk.factorize(token, values)
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
 
     x, token = step(token, values * 4.0, b, False)
     assert _rel_err(A, x, b) < 1e-10  # skip branch: old factors
@@ -283,27 +283,27 @@ def test_custom_vjp_adjoint_reuse(monkeypatch):
 
     @jax.custom_vjp
     def token_solve(vals, b):
-        t = tk.analyze(vals, offsets, columns)
-        t = tk.factorize(t, vals)
-        return tk.solve(t, b)
+        t = cudss.analyze(vals, offsets, columns)
+        t = cudss.factorize(t, vals)
+        return cudss.solve(t, b)
 
     def fwd(vals, b):
-        t = tk.analyze(vals, offsets, columns)
-        t = tk.factorize(t, vals)
-        return tk.solve(t, b), t  # token threads through residuals
+        t = cudss.analyze(vals, offsets, columns)
+        t = cudss.factorize(t, vals)
+        return cudss.solve(t, b), t  # token threads through residuals
 
     def bwd(t, v):
         # symmetric: lambda = A^-T v = A^-1 v, reusing the forward factors
-        return (None, tk.solve(t, v))
+        return (None, cudss.solve(t, v))
 
     token_solve.defvjp(fwd, bwd)
 
-    size_before = tk.registry_size()
+    size_before = cudss.registry_size()
     grad_b = jax.jit(jax.grad(lambda v, b: token_solve(v, b).sum(), argnums=1))(values, b)
     expected = np.linalg.solve(np.asarray(A), np.ones(A.shape[0]))
     np.testing.assert_allclose(np.asarray(grad_b), expected, rtol=1e-10)
     # forward+backward share ONE factorization
-    assert tk.registry_size() - size_before == 1
+    assert cudss.registry_size() - size_before == 1
 
 
 # inertia ======================================================================
@@ -314,9 +314,9 @@ def test_inertia_indefinite():
     eigs = np.linalg.eigvalsh(np.asarray(A))
     expected = [int((eigs > 0).sum()), int((eigs < 0).sum())]
 
-    token = tk.analyze(values, offsets, columns)
-    token = tk.factorize(token, values)
-    inertia = tk.inertia(tk.query(token))
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
+    inertia = cudss.inertia(cudss.query(token))
     np.testing.assert_array_equal(np.asarray(inertia), expected)
 
 
@@ -347,9 +347,9 @@ def test_inertia_heterogeneous_batch_attribution():
         np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
     vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks]))
 
-    token = tk.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
-    token = tk.factorize(token, vals)
-    inertia = tk.inertia(tk.query(token), batch_size=4)
+    token = cudss.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
+    token = cudss.factorize(token, vals)
+    inertia = cudss.inertia(cudss.query(token), batch_size=4)
     np.testing.assert_array_equal(np.asarray(inertia), expected)
 
 
@@ -358,33 +358,56 @@ def test_solve_before_factorize_raises():
     _require_gpu()
     values, offsets, columns, A = _sym_system()
     b = jnp.asarray(np.random.default_rng(15).standard_normal(A.shape[0]))
-    token = tk.analyze(values, offsets, columns)
+    token = cudss.analyze(values, offsets, columns)
     with pytest.raises(Exception, match="requires a factorized token"):
-        tk.solve(token, b).block_until_ready()
+        cudss.solve(token, b).block_until_ready()
 
 
 def test_refactorize_before_factorize_raises():
     _require_gpu()
     values, offsets, columns, _ = _sym_system()
-    token = tk.analyze(values, offsets, columns)
+    token = cudss.analyze(values, offsets, columns)
     with pytest.raises(Exception, match="requires a factorized token"):
-        tk.refactorize(token, values).id.block_until_ready()
+        cudss.refactorize(token, values).id.block_until_ready()
 
 
 def test_values_size_mismatch_raises():
     _require_gpu()
     values, offsets, columns, _ = _sym_system()
-    token = tk.analyze(values, offsets, columns)
+    token = cudss.analyze(values, offsets, columns)
     with pytest.raises(ValueError, match="nnz"):
-        tk.factorize(token, values[:-1])
+        cudss.factorize(token, values[:-1])
 
 
 def test_dtype_mismatch_raises():
     _require_gpu()
     values, offsets, columns, _ = _sym_system(dtype=jnp.float64)
-    token = tk.analyze(values, offsets, columns)
+    token = cudss.analyze(values, offsets, columns)
     with pytest.raises(ValueError, match="dtype"):
-        tk.factorize(token, values.astype(jnp.float32))
+        cudss.factorize(token, values.astype(jnp.float32))
+
+
+def test_structure_tampering_raises():
+    """A token's offsets/columns leaves are immutable by contract.
+
+    Sizes alone cannot catch a swapped same-shaped pattern, and cuDSS would
+    silently factorize it against the WRONG analysis/pivot order — so every
+    phase verifies the structure CONTENT against the fingerprint stored at
+    analysis and must fail loudly here.
+    """
+    import dataclasses
+
+    _require_gpu()
+    values, offsets, columns, A = _sym_system()
+    b = jnp.asarray(np.random.default_rng(22).standard_normal(A.shape[0]))
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
+
+    tampered = dataclasses.replace(token, columns=jnp.roll(token.columns, 1))
+    with pytest.raises(Exception, match="fingerprint"):
+        cudss.solve(tampered, b).block_until_ready()
+    with pytest.raises(Exception, match="fingerprint"):
+        cudss.factorize(tampered, values).id.block_until_ready()
 
 
 # ported from the legacy CuDSSSolver/CuDSSSolverRE suite ======================
@@ -426,9 +449,9 @@ def test_legacy_composability():
     b = jnp.vstack([b1, b2])
 
     def token_solve(values, b):
-        t = tk.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
-        t = tk.factorize(t, values)
-        return tk.solve(t, b)
+        t = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, values)
+        return cudss.solve(t, b)
 
     x1 = token_solve(values[0], b[0])
     x2 = jax.jit(jax.vmap(token_solve))(values, b)
@@ -451,9 +474,9 @@ def test_legacy_nested_vmap():
     b = jnp.stack([jnp.stack([b1, b1])] * 2)
 
     def token_solve(values, b):
-        t = tk.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
-        t = tk.factorize(t, values)
-        return tk.solve(t, b)
+        t = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, values)
+        return cudss.solve(t, b)
 
     jax.jit(jax.vmap(jax.vmap(token_solve)))(values, b)
 
@@ -466,9 +489,9 @@ def test_legacy_datatypes(dtype):
     _, b1, m1, true_x1 = _legacy_base_system(dtype)
     offsets, columns, values = _csr_of(m1)  # full symmetric matrix, mview full
 
-    token = tk.analyze(values, offsets, columns, mtype_id=1, mview_id=0)
-    token = tk.factorize(token, values)
-    x = tk.solve(token, b1)
+    token = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=0)
+    token = cudss.factorize(token, values)
+    x = cudss.solve(token, b1)
 
     assert x.shape == b1.shape
     assert jnp.allclose(x, true_x1, rtol=1e-5, atol=1e-5)
@@ -480,9 +503,9 @@ def test_legacy_solver_types(mtype_id):
     _, b1, m1, true_x1 = _legacy_base_system(jnp.float32)
     offsets, columns, values = _csr_of(m1)
 
-    token = tk.analyze(values, offsets, columns, mtype_id=mtype_id, mview_id=0)
-    token = tk.factorize(token, values)
-    x = tk.solve(token, b1)
+    token = cudss.analyze(values, offsets, columns, mtype_id=mtype_id, mview_id=0)
+    token = cudss.factorize(token, values)
+    x = cudss.solve(token, b1)
 
     assert x.shape == b1.shape
     assert jnp.allclose(x, true_x1, rtol=1e-5, atol=1e-5)
@@ -495,12 +518,12 @@ def test_query():
     offsets, columns, values = _csr_of(M1)  # upper triangle, mview upper
     n = b1.shape[0]
 
-    token = tk.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
-    token = tk.factorize(token, values)
-    x = tk.solve(token, b1)
+    token = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+    token = cudss.factorize(token, values)
+    x = cudss.solve(token, b1)
     assert jnp.allclose(x, true_x1, rtol=1e-5, atol=1e-5)
 
-    out = tk.query(token)
+    out = cudss.query(token)
     assert out["lu_nnz"][0] > 0
     assert out["npivots"][0] >= 0
     assert out["inertia"].shape == (2,)
@@ -514,18 +537,50 @@ def test_query():
     assert out["schur_shape"].shape == (2,)
 
     # inertia() over the same data agrees with a fresh query after refactorize
-    inr1 = tk.inertia(out)
-    token = tk.factorize(token, values)
-    inr2 = tk.inertia(tk.query(token))
+    inr1 = cudss.inertia(out)
+    token = cudss.factorize(token, values)
+    inr2 = cudss.inertia(cudss.query(token))
     np.testing.assert_array_equal(np.asarray(inr1), np.asarray(inr2))
 
 
 def test_query_before_factorize_raises():
     _require_gpu()
     values, offsets, columns, _ = _sym_system()
-    token = tk.analyze(values, offsets, columns)
+    token = cudss.analyze(values, offsets, columns)
     with pytest.raises(Exception, match="requires a factorized token"):
-        jax.block_until_ready(tk.query(token))
+        jax.block_until_ready(cudss.query(token))
+
+
+# lineax adapter (the default user API, defined in solver.py) ================
+def test_lineax_adapter():
+    import lineax as lx
+
+    _require_gpu()
+    *_, A = _sym_system(n=40, shift=0.0, seed=13)
+    # full-pattern operator from the dense symmetric matrix
+    import jax.experimental.sparse as jsparse
+
+    sp = jsparse.BCSR.fromdense(jnp.asarray(A))
+    operator = cudss.CSRSymmetricOperator(sp.data, sp.indptr, sp.indices)
+    solver = cudss.CuDSS()
+    b = jnp.asarray(np.random.default_rng(23).standard_normal(A.shape[0]))
+
+    # explicit phases incl. query
+    token = solver.analyze(operator)
+    token = solver.factorize(token, operator)
+    x = solver.solve(token, b)
+    assert _rel_err(A, x, b) < 1e-10
+    eigs = np.linalg.eigvalsh(np.asarray(A))
+    inr = cudss.inertia(solver.query(token))
+    np.testing.assert_array_equal(
+        np.asarray(inr), [int((eigs > 0).sum()), int((eigs < 0).sum())])
+
+    # lineax protocol, interoperating with the explicit token as state=
+    x2 = lx.linear_solve(operator, b, solver, state=token).value
+    np.testing.assert_allclose(np.asarray(x2), np.asarray(x), rtol=1e-12)
+    sol = lx.linear_solve(operator, b, solver)
+    assert _rel_err(A, sol.value, b) < 1e-10
+    assert cudss.release(sol.state) is True
 
 
 # lifetime =====================================================================
@@ -533,27 +588,27 @@ def test_release():
     _require_gpu()
     values, offsets, columns, A = _sym_system()
     b = jnp.asarray(np.random.default_rng(16).standard_normal(A.shape[0]))
-    token = tk.analyze(values, offsets, columns)
-    token = tk.factorize(token, values)
-    tk.solve(token, b).block_until_ready()
+    token = cudss.analyze(values, offsets, columns)
+    token = cudss.factorize(token, values)
+    cudss.solve(token, b).block_until_ready()
 
-    assert tk.release(token) is True
-    assert tk.release(token) is False  # second release is a no-op
+    assert cudss.release(token) is True
+    assert cudss.release(token) is False  # second release is a no-op
     with pytest.raises(Exception, match="unknown or evicted"):
-        tk.solve(token, b).block_until_ready()
+        cudss.solve(token, b).block_until_ready()
 
 
 def test_lru_eviction():
     _require_gpu()
     values, offsets, columns, _ = _sym_system()
     b = jnp.asarray(np.random.default_rng(17).standard_normal(offsets.shape[0] - 1))
-    cap = tk.cache_capacity()
+    cap = cudss.cache_capacity()
 
-    victim = tk.analyze(values, offsets, columns)
-    victim = tk.factorize(victim, values)
+    victim = cudss.analyze(values, offsets, columns)
+    victim = cudss.factorize(victim, values)
     # cap fresh entries push the untouched victim out
     for _ in range(cap):
-        tk.analyze(values, offsets, columns).id.block_until_ready()
-    assert tk.registry_size() <= cap
+        cudss.analyze(values, offsets, columns).id.block_until_ready()
+    assert cudss.registry_size() <= cap
     with pytest.raises(Exception, match="unknown or evicted"):
-        tk.solve(victim, b).block_until_ready()
+        cudss.solve(victim, b).block_until_ready()

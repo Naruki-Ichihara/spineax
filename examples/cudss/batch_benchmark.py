@@ -8,7 +8,7 @@ jax.devices()  # force CUDA init before spineax import
 
 import jax.numpy as jnp
 import scipy.sparse as sp
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 # Load the linear system (COO format)
 data = np.load('/home/john/code/jax_ssids/systems/quad_kkt_systems/iter_1.npz')
@@ -32,13 +32,13 @@ b = jnp.array(rhs, dtype=jnp.float64)
 print(f"Matrix size: {n}x{n}, nnz: {csr.nnz}")
 
 # Single solve to verify correctness - symmetric, upper triangular view (KKT)
-token = tk.analyze(csr_values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
-token = tk.factorize(token, csr_values)
-x = tk.solve(token, b)
+token = cudss.analyze(csr_values, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+token = cudss.factorize(token, csr_values)
+x = cudss.solve(token, b)
 residual = jnp.linalg.norm(jnp.array(csr.toarray()) @ x - b)
 print(f"Single solve residual: {residual:.2e}")
-print(f"Inertia: {tk.inertia(tk.query(token))}")
-tk.release(token)
+print(f"Inertia: {cudss.inertia(cudss.query(token))}")
+cudss.release(token)
 
 # Batch - tile the same system into ONE block-diagonal factorization
 # (explicit batch door: (B, nnz) values, shared pattern)
@@ -46,12 +46,12 @@ batch_size = 2000
 b_batch = jnp.tile(b[None, :], (batch_size, 1))
 csr_values_batch = jnp.tile(csr_values[None, :], (batch_size, 1))
 
-refact_j = jax.jit(tk.refactorize)
-solve_j = jax.jit(tk.solve)
+refact_j = jax.jit(cudss.refactorize)
+solve_j = jax.jit(cudss.solve)
 
 # Warm up (includes block analysis + first factorization)
-btoken = tk.analyze(csr_values_batch, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
-btoken = tk.factorize(btoken, csr_values_batch)
+btoken = cudss.analyze(csr_values_batch, csr_offsets, csr_columns, mtype_id=1, mview_id=1)
+btoken = cudss.factorize(btoken, csr_values_batch)
 x_batch = solve_j(btoken, b_batch)
 jax.block_until_ready(x_batch)
 print(f"\nBatch solve output shape: {x_batch.shape}")
@@ -124,17 +124,17 @@ for i in range(n):
 csr_values_spd = jnp.array(spd_data, dtype=jnp.float64)
 
 # SPD (mtype_id=3), same upper triangular view - single solve to verify
-token_spd = tk.analyze(csr_values_spd, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
-token_spd = tk.factorize(token_spd, csr_values_spd)
-print(f"Single solve inertia: {tk.inertia(tk.query(token_spd))}")
-tk.release(token_spd)
+token_spd = cudss.analyze(csr_values_spd, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
+token_spd = cudss.factorize(token_spd, csr_values_spd)
+print(f"Single solve inertia: {cudss.inertia(cudss.query(token_spd))}")
+cudss.release(token_spd)
 
 # Batch
 csr_values_spd_batch = jnp.tile(csr_values_spd[None, :], (batch_size, 1))
 
 # Warm up
-btoken_spd = tk.analyze(csr_values_spd_batch, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
-btoken_spd = tk.factorize(btoken_spd, csr_values_spd_batch)
+btoken_spd = cudss.analyze(csr_values_spd_batch, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
+btoken_spd = cudss.factorize(btoken_spd, csr_values_spd_batch)
 x_batch_spd = solve_j(btoken_spd, b_batch)
 jax.block_until_ready(x_batch_spd)
 print(f"Batch solve output shape: {x_batch_spd.shape}")
@@ -171,12 +171,12 @@ print("Cholesky on indefinite matrix - expect failure")
 print("="*60)
 
 try:
-    token_fail = tk.analyze(csr_values, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
-    token_fail = tk.factorize(token_fail, csr_values)
-    x_fail = tk.solve(token_fail, b)
+    token_fail = cudss.analyze(csr_values, csr_offsets, csr_columns, mtype_id=3, mview_id=1)
+    token_fail = cudss.factorize(token_fail, csr_values)
+    x_fail = cudss.solve(token_fail, b)
     jax.block_until_ready(x_fail)
     # Check if cuDSS silently produced garbage (non-zero negative inertia means indefinite)
-    inertia_fail = np.array(tk.inertia(tk.query(token_fail)))
+    inertia_fail = np.array(cudss.inertia(cudss.query(token_fail)))
     if inertia_fail[1] > 0:
         print(f"PASS: cuDSS detected indefiniteness via inertia: {inertia_fail}")
     else:

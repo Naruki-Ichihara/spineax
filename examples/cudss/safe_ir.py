@@ -14,7 +14,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
-from spineax.cudss import tokens as tk
+from spineax import cudss
 
 
 def make_kkt_batch(n_x=100, n_c=40, batch_size=8, seed=0):
@@ -117,19 +117,19 @@ def test_safe_ir():
     n = full_offsets.shape[0] - 1  # matrix dimension
 
     # ONE block-diagonal entry for the whole batch (explicit batch door)
-    token = tk.analyze(upper_vals_batch, upper_offsets, upper_columns,
+    token = cudss.analyze(upper_vals_batch, upper_offsets, upper_columns,
                        mtype_id=1, mview_id=1)
 
     @jax.jit
     def safe_ir_solve(token, b_batch, upper_vals_batch, full_vals_batch):
         # 1. Factorize only (no solve)
-        token = tk.factorize(token, upper_vals_batch)
+        token = cudss.factorize(token, upper_vals_batch)
 
         # 2. Solve without IR
-        x0 = tk.solve(token, b_batch, ir_nsteps=0)
+        x0 = cudss.solve(token, b_batch, ir_nsteps=0)
 
         # 3. Solve with IR=20 (reuses the same factorization)
-        x_ir = tk.solve(token, b_batch, ir_nsteps=20)
+        x_ir = cudss.solve(token, b_batch, ir_nsteps=20)
 
         # 4. Per-element residual norms via sparse matvec (no dense materialization)
         resid_fn = lambda vals, x, b: sparse_residual_norm(vals, full_offsets, full_columns, n, x, b)
@@ -146,7 +146,7 @@ def test_safe_ir():
         safe_ir_solve(token, b_batch, upper_vals_batch, full_vals_batch)
 
     # Per-block inertia from the one data door
-    inertia = tk.inertia(tk.query(token), batch_size=batch_size)
+    inertia = cudss.inertia(cudss.query(token), batch_size=batch_size)
 
     # Report per-element results
     print(f"\n  {'elem':>4}  {'type':>6}  {'cond(K)':>10}  {'inertia':>10}  {'err(ir=0)':>10}  "
