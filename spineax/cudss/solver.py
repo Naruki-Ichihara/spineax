@@ -10,7 +10,7 @@ Four free functions mapping 1:1 onto cuDSS phases, plus one data door:
     inr   = inertia(data, batch_size)  # per-block [pos, neg] from that data
 
 The ``FactorToken`` is a pytree: the traced ``int32`` registry id (dataflow
-ordering, ``custom_vjp`` residuals, vmap batching) plus ZERO-COPY references
+ordering, autodiff residuals, vmap batching) plus ZERO-COPY references
 to the caller's CSR arrays (``values``/``offsets``/``columns``) and static
 metadata. Holding the CSR arrays in the token keeps them alive exactly as
 long as the factorization they produced, and every phase call passes them to
@@ -38,6 +38,22 @@ Inertia (per-block positive/negative eigenvalue counts from the LDL^T
 diagonal) is a property of the factorization: ``query`` the token after
 ``factorize`` / ``refactorize`` and pass the result to ``inertia`` — an IPM
 can inspect it before paying for a solve.
+
+The raw phase chain is differentiable to ARBITRARY ORDER for every mtype:
+``analyze``/``factorize``/``refactorize`` carry recursive identity rules
+(the values tangent rides the token's values leaf; nothing differentiates
+the factors L/D themselves), and ``solve`` is a ``lax.custom_linear_solve``
+whose matvec is the token's operator written in differentiable jnp gathers
+— JAX's implicit-function-theorem rules for that primitive are expressed in
+terms of the primitive itself, so grads, jvps, hessians etc. all reduce to
+extra SOLVEs against existing factors. The one asymmetric cost: cuDSS has
+no transpose solve (CUDSS_CONFIG_SOLVE_MODE is unimplemented as of 0.8), so
+reverse-mode through a GENERAL (mtype 0) token factorizes A^T on the fly in
+the backward pass — one extra analyze+factorize+registry entry per backward
+execution. Symmetric/spd reuse the forward factors directly (A^T = A) and
+hermitian/hpd via conjugation (A^T x = c  <=>  x = conj(A^-1 conj(c))).
+``lx.linear_solve`` via the ``CuDSS`` adapter below is differentiable
+independently, through lineax's own machinery.
 """
 
 import dataclasses
@@ -49,6 +65,7 @@ import jax.experimental.sparse as jsparse
 import jax.flatten_util as jfu
 import jax.numpy as jnp
 import lineax as lx
+import numpy as np
 from jaxtyping import Array
 
 # Force JAX to initialize the CUDA context before importing the native module.
@@ -93,29 +110,6 @@ def _suffix(dtype) -> str:
         ) from None
 
 
-def compute_inertia_from_diag(diag, batch_size, matrix_dim):
-    """Per-block [positive, negative] counts from the LDL^T diagonal.
-
-    cuDSS >= 0.8 returns CUDSS_DATA_DIAG **in input order** ("the original
-    matrix order, taking into account all permutations" — cuDSS docs; changed
-    in the 0.8 release notes from the internal order of <= 0.7). Input order
-    is block-grouped, so the reshape splits cleanly per block and NO
-    permutation may be applied. The legacy ``diag[argsort(perm)]`` reorder
-    was correct for cuDSS <= 0.7 and silently misattributes blocks in
-    heterogeneous batches on 0.8 (found via the newton_ipm_loop example;
-    verified against the docs with a distinct-diagonal experiment).
-    """
-    out = diag.reshape([batch_size, matrix_dim])
-
-    # cuDSS pivoting threshold seems to be 1e-13. everything above this on
-    # plus or minus side seems to reliably indicate that particular inertia value.
-    threshold = 1e-13
-    positive = jnp.sum(out >= threshold, axis=1)
-    negative = jnp.sum(out <= -threshold, axis=1)
-
-    return jnp.stack([positive, negative], axis=1, dtype=jnp.int32)
-
-
 # the token ====================================================================
 class FactorToken(eqx.Module):
     """Handle to a cached cuDSS (block-diagonal) factorization.
@@ -146,12 +140,6 @@ class FactorToken(eqx.Module):
     mtype_id: int = eqx.field(static=True)
     mview_id: int = eqx.field(static=True)
     device_id: int = eqx.field(static=True)
-
-
-def _advance(token: FactorToken, new_id: Array, new_values: Array) -> FactorToken:
-    """Thread the token forward through a numeric phase: same entry id
-    (dataflow-ordered), values leaf swapped to the just-factorized values."""
-    return dataclasses.replace(token, id=new_id, values=new_values)
 
 
 def _structure_fingerprint(offsets_bd, columns_bd):
@@ -206,15 +194,20 @@ def _expand_structure(offsets, columns, batch_size):
                                                           columns_bd)
 
 
-def _as_ir(ir_nsteps) -> Array:
-    """Normalize the optional iterative-refinement argument to int32[1].
+def _ir_off():
+    """cuDSS-internal iterative refinement is permanently OFF.
 
-    Default is 0: IR is numerically wrong for LDL^T (dev-branch finding), so it
-    is strictly opt-in.
+    Its refinement SpMV dereferences CSR pointers captured at earlier phase
+    calls (compute-sanitizer: out-of-bounds atomics in cudss::spmv_ker when
+    the expanded batch structure is an already-freed XLA temporary; keeping
+    one persistent copy alive fixes it, but duplicates the pattern across
+    shared-pattern batches). ``solve``'s ``ir_nsteps`` is instead implemented
+    JAX-side in ``_refined_solve`` — same-precision Richardson refinement,
+    which is what cuDSS runs internally anyway — whose residual SpMV
+    consumes its expanded indices inside the executable that builds them,
+    so nothing needs to outlive the call.
     """
-    if ir_nsteps is None:
-        return jnp.zeros((1,), dtype=jnp.int32)
-    return jnp.asarray(ir_nsteps, dtype=jnp.int32).reshape((1,))
+    return jnp.zeros((1,), dtype=jnp.int32)
 
 
 def _batch_of(token: FactorToken) -> int:
@@ -246,23 +239,23 @@ def _ffi_analyze(values, offsets_bd, columns_bd, fingerprint, *, batch_size,
     )
 
 
-def _ffi_numeric(token_id, offsets_bd, columns_bd, fingerprint, values, ir,
-                 *, op):
+def _ffi_numeric(token_id, offsets_bd, columns_bd, fingerprint, values, *, op):
     fn = jax.ffi.ffi_call(
         f"spineax_token_{op}_{_suffix(values.dtype)}",
         jax.ShapeDtypeStruct(token_id.shape, jnp.int32),  # token (same ids)
         has_side_effect=True,
     )
-    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, ir)
+    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, _ir_off())
 
 
-def _ffi_solve(token_id, offsets_bd, columns_bd, fingerprint, values, b, ir):
+def _ffi_solve(token_id, offsets_bd, columns_bd, fingerprint, values, b):
     fn = jax.ffi.ffi_call(
         f"spineax_token_solve_{_suffix(b.dtype)}",
         jax.ShapeDtypeStruct(b.shape, b.dtype),
         has_side_effect=True,
     )
-    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, b, ir)
+    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, b,
+              _ir_off())
 
 
 # vmap-aware wrappers over the single (B=1) view ===============================
@@ -306,18 +299,13 @@ def _make_numeric(suffix, refactor):
     del suffix
 
     @jax.custom_batching.custom_vmap
-    def numeric_id(token_id, offsets, columns, csr_values, ir):
+    def numeric_id(token_id, offsets, columns, csr_values):
         offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
-        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, csr_values, ir,
-                            op=op)
+        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, csr_values, op=op)
 
     @numeric_id.def_vmap
-    def _(axis_size, in_batched, token_id, offsets, columns, csr_values, ir):
-        tb, _, _, vb, ib = in_batched
-        if ib:
-            raise ValueError(
-                f"spineax tokens: ir_nsteps cannot vary across a batched "
-                f"{op} — one block-diagonal phase has one IR setting")
+    def _(axis_size, in_batched, token_id, offsets, columns, csr_values):
+        tb, _, _, vb = in_batched
         if not tb:
             raise ValueError(
                 f"spineax tokens: vmap({op}) with an unbatched token and "
@@ -326,8 +314,7 @@ def _make_numeric(suffix, refactor):
         vals = csr_values if vb else jnp.broadcast_to(
             csr_values, (axis_size,) + csr_values.shape)
         offs_bd, cols_bd, fp = _expand_structure(offsets, columns, axis_size)
-        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, vals, ir,
-                            op=op), True
+        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, vals, op=op), True
 
     return numeric_id
 
@@ -337,30 +324,33 @@ def _make_solve(suffix):
     del suffix
 
     @jax.custom_batching.custom_vmap
-    def solve_id(token_id, offsets, columns, values, b_values, ir):
+    def solve_id(token_id, offsets, columns, values, b_values):
+        # The base case already absorbs any leading rhs axes as one
+        # multi-RHS SOLVE (nrhs is derived from element counts).
         offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
-        return _ffi_solve(token_id, offs_bd, cols_bd, fp, values, b_values, ir)
+        return _ffi_solve(token_id, offs_bd, cols_bd, fp, values, b_values)
 
     @solve_id.def_vmap
-    def _(axis_size, in_batched, token_id, offsets, columns, values, b_values, ir):
-        tb, _, _, vb, bb, ib = in_batched
-        if ib:
-            raise ValueError(
-                "spineax tokens: ir_nsteps cannot vary across a batched solve")
+    def _(axis_size, in_batched, token_id, offsets, columns, values, b_values):
+        # Collapse ONE batch axis, then RECURSE into the wrapped function
+        # (never the raw FFI): transforms are free to re-batch the result —
+        # jacfwd-of-grad nests a vmap per differentiation order — and each
+        # extra axis peels off through this rule again.
+        tb, _, _, vb, bb = in_batched
         b = b_values if bb else jnp.broadcast_to(
             b_values, (axis_size,) + b_values.shape)
-        # One call either way, courtesy of the layout identities:
-        # - unbatched token (one entry, N=n) + (B, n) rhs -> one multi-RHS SOLVE;
-        # - batched ids (one block entry, N=B*n) + (B, n) rhs -> one block SOLVE.
-        if tb:
-            offs_bd, cols_bd, fp = _expand_structure(offsets, columns,
-                                                     axis_size)
-            vals = values if vb else jnp.broadcast_to(
-                values, (axis_size,) + values.shape)
-        else:
-            offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
-            vals = values
-        return _ffi_solve(token_id, offs_bd, cols_bd, fp, vals, b, ir), True
+        if not tb:
+            # unbatched token: the batch axis is just more rhs columns
+            return solve_id(token_id, offsets, columns, values, b), True
+        # batched ids (one block entry): flatten the batch axis into the ONE
+        # block-diagonal system of dimension B*n and solve it single-style
+        offs_bd, cols_bd, _ = _expand_structure(offsets, columns, axis_size)
+        vals = values if vb else jnp.broadcast_to(
+            values, (axis_size,) + values.shape)
+        b2 = jnp.moveaxis(b, 0, -2)  # (B, ..., n) -> (..., B, n)
+        bf = b2.reshape(b2.shape[:-2] + (-1,))
+        out = solve_id(token_id[0], offs_bd, cols_bd, vals.reshape(-1), bf)
+        return jnp.moveaxis(out.reshape(b2.shape), -2, 0), True
 
     return solve_id
 
@@ -389,39 +379,65 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
     entry (the token id is broadcast across the batch); an unbatched system is
     hoisted out and analyzed once.
     """
-    dtype = jnp.dtype(csr_values.dtype)
-    csr_offsets = csr_offsets.astype(jnp.int32)
-    csr_columns = csr_columns.astype(jnp.int32)
-    n = csr_offsets.shape[-1] - 1
-    nnz = csr_columns.shape[-1]
-    if csr_values.ndim == 2:
-        # explicit block-diagonal batch door
-        batch_size = csr_values.shape[0]
-        offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns,
-                                                 int(batch_size))
-        token_id = _ffi_analyze(
-            csr_values, offs_bd, cols_bd, fp,
-            batch_size=int(batch_size),
-            device_id=int(device_id), mtype_id=int(mtype_id),
-            mview_id=int(mview_id))
+    core = _make_analyze_ad(_suffix(jnp.dtype(csr_values.dtype)),
+                            int(device_id), int(mtype_id), int(mview_id))
+    return core(csr_values, csr_offsets.astype(jnp.int32),
+                csr_columns.astype(jnp.int32))
+
+
+@lru_cache(maxsize=None)
+def _make_analyze_ad(suffix, device_id, mtype_id, mview_id):
+    """The analyze implementation wrapped for autodiff (identity rule)."""
+
+    def impl(csr_values, csr_offsets, csr_columns):
+        dtype = jnp.dtype(csr_values.dtype)
+        n = csr_offsets.shape[-1] - 1
+        nnz = csr_columns.shape[-1]
+        if csr_values.ndim == 2:
+            # explicit block-diagonal batch door
+            batch_size = int(csr_values.shape[0])
+            offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns,
+                                                     batch_size)
+            token_id = _ffi_analyze(
+                csr_values, offs_bd, cols_bd, fp,
+                batch_size=batch_size, device_id=device_id,
+                mtype_id=mtype_id, mview_id=mview_id)
+            return FactorToken(
+                id=token_id, values=csr_values, offsets=csr_offsets,
+                columns=csr_columns,
+                kind="pbatch", dtype=dtype, n=int(n), nnz=int(nnz),
+                batch_size=batch_size, mtype_id=mtype_id,
+                mview_id=mview_id, device_id=device_id)
+        token_id = _make_analyze(suffix, device_id, mtype_id, mview_id)(
+            csr_values, csr_offsets, csr_columns)
         return FactorToken(
             id=token_id, values=csr_values, offsets=csr_offsets,
             columns=csr_columns,
-            kind="pbatch", dtype=dtype, n=int(n), nnz=int(nnz),
-            batch_size=int(batch_size), mtype_id=int(mtype_id),
-            mview_id=int(mview_id), device_id=int(device_id))
-    token_id = _make_analyze(
-        _suffix(dtype), int(device_id), int(mtype_id), int(mview_id)
-    )(csr_values, csr_offsets, csr_columns)
-    return FactorToken(
-        id=token_id, values=csr_values, offsets=csr_offsets,
-        columns=csr_columns,
-        kind="single", dtype=dtype, n=int(n), nnz=int(nnz),
-        batch_size=1, mtype_id=int(mtype_id), mview_id=int(mview_id),
-        device_id=int(device_id))
+            kind="single", dtype=dtype, n=int(n), nnz=int(nnz),
+            batch_size=1, mtype_id=mtype_id, mview_id=mview_id,
+            device_id=device_id)
+
+    core = jax.custom_jvp(impl)
+
+    @core.defjvp
+    def _(primals, tangents):
+        # Recursive call (not impl): under higher-order differentiation the
+        # primals themselves carry tangents, which must hit this rule again
+        # rather than the raw ffi_call inside impl.
+        dvals, _, _ = tangents
+        token = core(*primals)
+        # tangent = values tangent on the values leaf, float0 zeros on the
+        # non-differentiable integer leaves
+        f0 = lambda x: np.zeros(jnp.shape(x), jax.dtypes.float0)
+        dtoken = dataclasses.replace(
+            token, id=f0(token.id), values=dvals,
+            offsets=f0(token.offsets), columns=f0(token.columns))
+        return token, dtoken
+
+    return core
 
 
-def _numeric(token, csr_values, ir_nsteps, refactor):
+def _numeric(token, csr_values, refactor):
     op = "refactorize" if refactor else "factorize"
     if jnp.dtype(csr_values.dtype) != token.dtype:
         raise ValueError(
@@ -431,38 +447,72 @@ def _numeric(token, csr_values, ir_nsteps, refactor):
         raise ValueError(
             f"spineax tokens: {op} values size {csr_values.shape[-1]} != "
             f"token nnz {token.nnz}")
-    ir = _as_ir(ir_nsteps)
+    B = _batch_of(token)
+    if (B > 1 or token.id.ndim == 2) and (
+            csr_values.ndim != 2 or csr_values.shape[0] != B):
+        raise ValueError(
+            f"spineax tokens: {op} on a batch token expects values "
+            f"({B}, {token.nnz}), got {csr_values.shape}")
+    return _make_numeric_ad(refactor)(token, csr_values)
 
+
+def _numeric_impl(token, csr_values, refactor):
+    op = "refactorize" if refactor else "factorize"
     B = _batch_of(token)
     if B > 1 or token.id.ndim == 2:
         # batch entry used eagerly (explicit door, or vmap-minted token used
         # outside vmap): one block-diagonal numeric phase
-        if csr_values.ndim != 2 or csr_values.shape[0] != B:
-            raise ValueError(
-                f"spineax tokens: {op} on a batch token expects values "
-                f"({B}, {token.nnz}), got {csr_values.shape}")
         offs_bd, cols_bd, fp = _expand_structure(token.offsets,
                                                  token.columns, B)
         token_id = _ffi_numeric(token.id, offs_bd, cols_bd, fp, csr_values,
-                                ir, op=op)
-        return _advance(token, token_id, csr_values)
+                                op=op)
+    else:
+        token_id = _make_numeric(_suffix(token.dtype), refactor)(
+            token.id, token.offsets, token.columns, csr_values)
+    # same entry id (dataflow-ordered), values leaf swapped to the
+    # just-factorized values
+    return dataclasses.replace(token, id=token_id, values=csr_values)
 
-    token_id = _make_numeric(_suffix(token.dtype), refactor)(
-        token.id, token.offsets, token.columns, csr_values, ir)
-    return _advance(token, token_id, csr_values)
+
+@lru_cache(maxsize=None)
+def _make_numeric_ad(refactor):
+    """The numeric-phase implementation wrapped for autodiff.
+
+    The rule is a pure identity pass-through: the tangent of ``csr_values``
+    rides into the output token's ``values`` leaf and the FFI id output is
+    non-differentiable. This is mathematically complete because ``solve``
+    below differentiates through the factorization via the implicit
+    function theorem — no derivative of the factors L/D is ever needed.
+    The rule calls the wrapped function recursively so it composes to any
+    differentiation order (higher-order primals carry tangents that must
+    re-enter this rule, not the raw ffi_call).
+    """
+
+    def impl(token, csr_values):
+        return _numeric_impl(token, csr_values, refactor)
+
+    core = jax.custom_jvp(impl)
+
+    @core.defjvp
+    def _(primals, tangents):
+        dtoken, dvals = tangents
+        out = core(*primals)
+        return out, dataclasses.replace(dtoken, values=dvals)
+
+    return core
 
 
-def factorize(token: FactorToken, csr_values, ir_nsteps=None) -> FactorToken:
+def factorize(token: FactorToken, csr_values) -> FactorToken:
     """Full numeric FACTORIZATION (fresh pivoting) of an analyzed token.
 
     Returns the token (same id — the dataflow ordering the chain). All
     post-factorization data, inertia included, comes from ``query`` /
     ``inertia``.
     """
-    return _numeric(token, csr_values, ir_nsteps, refactor=False)
+    return _numeric(token, csr_values, refactor=False)
 
 
-def refactorize(token: FactorToken, csr_values, ir_nsteps=None) -> FactorToken:
+def refactorize(token: FactorToken, csr_values) -> FactorToken:
     """REFACTORIZATION: new values, reusing the previous pivot order.
 
     Faster than ``factorize``, but numerically valid only while the old pivot
@@ -470,37 +520,140 @@ def refactorize(token: FactorToken, csr_values, ir_nsteps=None) -> FactorToken:
     same as cuDSS's contract. Requires a factorized token. Returns the token,
     like ``factorize``.
     """
-    return _numeric(token, csr_values, ir_nsteps, refactor=True)
+    return _numeric(token, csr_values, refactor=True)
 
 
 def solve(token: FactorToken, b, ir_nsteps=None):
-    """SOLVE phase only: ``x = A^{-1} b`` reusing the token's factorization.
-
-    For a single-system token ``b`` may be ``(n,)`` or a stack ``(..., n)``
-    (one multi-RHS cuDSS SOLVE). For a batch token ``b`` is ``(B, n)`` — or
-    ``(..., B, n)`` for multiple rhs per block — solved in one block SOLVE.
-    Under ``jax.vmap`` both cases likewise collapse to one call.
-    """
     if jnp.dtype(b.dtype) != token.dtype:
         raise ValueError(
             f"spineax tokens: rhs dtype {b.dtype} != token dtype {token.dtype}")
     if b.shape[-1] != token.n:
         raise ValueError(
             f"spineax tokens: rhs trailing dim {b.shape[-1]} != token n {token.n}")
-    ir = _as_ir(ir_nsteps)
-
     B = _batch_of(token)
-    if B > 1 or token.id.ndim == 2:
-        if b.ndim < 2 or b.shape[-2] != B:
-            raise ValueError(
-                f"spineax tokens: solve on a batch token expects rhs "
-                f"(..., {B}, {token.n}), got {b.shape}")
-        offs_bd, cols_bd, fp = _expand_structure(token.offsets,
-                                                 token.columns, B)
-        return _ffi_solve(token.id, offs_bd, cols_bd, fp, token.values, b, ir)
+    if (B > 1 or token.id.ndim == 2) and (b.ndim < 2 or b.shape[-2] != B):
+        raise ValueError(
+            f"spineax tokens: solve on a batch token expects rhs "
+            f"(..., {B}, {token.n}), got {b.shape}")
+    nsteps = 0 if ir_nsteps is None else int(ir_nsteps)  # static: unrolled
+    # The solver callables below are pure numerical inverses: all derivative
+    # information enters through the matvec closure (implicit function
+    # theorem), so the token they use is gradient-stopped.
+    tok_ng = jax.lax.stop_gradient(token)
 
-    return _make_solve(_suffix(token.dtype))(
-        token.id, token.offsets, token.columns, token.values, b, ir)
+    def mv(x):
+        return _matvec(token, x)
+
+    def solve_fn(_mv, rhs):
+        return _refined_solve(tok_ng, rhs, nsteps)
+
+    if token.mtype_id in (1, 3):  # A^T = A (incl. complex symmetric): same factors
+        return jax.lax.custom_linear_solve(mv, b, solve_fn, solve_fn,
+                                           symmetric=True)
+    if token.mtype_id in (2, 4):  # hermitian: A^T = conj(A), same factors
+
+        def t_solve(_mv, rhs):
+            return jnp.conj(_refined_solve(tok_ng, jnp.conj(rhs), nsteps))
+
+        return jax.lax.custom_linear_solve(mv, b, solve_fn, t_solve)
+
+    def t_solve(_mv, rhs):  # general: cuDSS has no transpose solve
+        return _transpose_solve_general(tok_ng, rhs, nsteps)
+
+    return jax.lax.custom_linear_solve(mv, b, solve_fn, t_solve)
+
+
+def _solve_impl(token, b):
+    B = _batch_of(token)
+    fn = _make_solve(_suffix(token.dtype))
+    if B > 1 or token.id.ndim == 2:
+        # batch entry used eagerly: solve the ONE expanded block-diagonal
+        # system single-style, through the same custom_vmap wrapper so any
+        # transform-added batch axes stay collapsible (multi-RHS)
+        offs_bd, cols_bd, _ = _expand_structure(token.offsets,
+                                                token.columns, B)
+        tid = token.id[0] if token.id.ndim == 2 else token.id
+        bf = b.reshape(b.shape[:-2] + (-1,))
+        out = fn(tid, offs_bd, cols_bd, token.values.reshape(-1), bf)
+        return out.reshape(b.shape)
+    return fn(token.id, token.offsets, token.columns, token.values, b)
+
+
+def _refined_solve(token, b, nsteps):
+    """``x = A^{-1} b`` plus ``nsteps`` rounds of JAX-side iterative
+    refinement: x += A^{-1}(b - A x), the residual computed by ``_matvec``.
+
+    Refinement lives HERE and never in cuDSS (see ``_ir_off``). Same
+    precision as the working dtype — exactly what cuDSS's internal IR does —
+    and safe for every door: the residual SpMV consumes its expanded indices
+    inside the executable that builds them, so no buffer has to outlive the
+    call. ``nsteps`` is static; the loop unrolls into the jaxpr.
+    """
+    x = _solve_impl(token, b)
+    for _ in range(nsteps):
+        x = x + _solve_impl(token, b - _matvec(token, x))
+    return x
+
+
+# autodiff for solve ===========================================================
+
+def _pattern_rows(offsets, nnz):
+    """Row index of each stored CSR entry, from the (possibly per-block
+    batched) offsets pattern."""
+    def one(o):
+        return jnp.repeat(jnp.arange(o.shape[-1] - 1, dtype=jnp.int32),
+                          jnp.diff(o), total_repeat_length=nnz)
+    return jax.vmap(one)(offsets) if offsets.ndim == 2 else one(offsets)
+
+
+def _gather_last(a, idx):
+    """a[..., idx] with idx either shared ``(nnz,)`` or per-block
+    ``(B, nnz)`` (matching a's ``(..., B, n)`` block axis)."""
+    if idx.ndim == 1:
+        return jnp.take(a, idx, axis=-1)
+    idx_b = jnp.broadcast_to(idx, a.shape[:-1] + (idx.shape[-1],))
+    return jnp.take_along_axis(a, idx_b, axis=-1)
+
+
+def _matvec(token, x):
+    B = _batch_of(token)
+    offs_bd, cols_bd, _ = _expand_structure(token.offsets, token.columns, B)
+    rows_bd = _pattern_rows(offs_bd, B * token.nnz)
+    vals = token.values.reshape(-1)
+    xf = x.reshape(x.shape[:-2] + (-1,)) if B > 1 else x
+    y = jnp.zeros_like(xf).at[..., rows_bd].add(
+        vals * _gather_last(xf, cols_bd))
+    if token.mview_id in (1, 2):
+        mvals = jnp.conj(vals) if token.mtype_id in (2, 4) else vals
+        mvals = jnp.where(rows_bd == cols_bd, 0, mvals)  # diag stored once
+        y = y.at[..., cols_bd].add(mvals * _gather_last(xf, rows_bd))
+    return y.reshape(x.shape)
+
+
+def _transpose_solve_general(token, rhs, nsteps):
+    """``A^-T rhs`` for a general (mtype 0) token.
+
+    cuDSS cannot solve against the transpose of existing factors
+    (CUDSS_CONFIG_SOLVE_MODE is "not supported right now" as of 0.8), so
+    reverse mode through a general solve transposes the CSR system on device
+    and runs a fresh analyze+factorize+solve. That is a full factorization
+    AND a new LRU registry entry per backward execution.
+    """
+    B = _batch_of(token)
+    offs_bd, cols_bd, _ = _expand_structure(token.offsets, token.columns, B)
+    N = offs_bd.shape[0] - 1
+    rows_bd = _pattern_rows(offs_bd, B * token.nnz)
+    vals = token.values.reshape(-1)
+    order = jnp.lexsort((rows_bd, cols_bd))  # CSR of A^T = CSC of A
+    t_offsets = jnp.concatenate([
+        jnp.zeros((1,), jnp.int32),
+        jnp.cumsum(jnp.zeros((N,), jnp.int32).at[cols_bd].add(1),
+                   dtype=jnp.int32)])
+    t_token = analyze(vals[order], t_offsets, rows_bd[order],
+                      mtype_id=0, mview_id=0, device_id=token.device_id)
+    t_token = factorize(t_token, t_token.values)
+    rf = rhs.reshape(rhs.shape[:-2] + (-1,)) if B > 1 else rhs
+    return _refined_solve(t_token, rf, nsteps).reshape(rhs.shape)
 
 
 _QUERY_FIELDS = (
@@ -511,20 +664,6 @@ _QUERY_FIELDS = (
 
 
 def query(token: FactorToken) -> dict:
-    """Read every cuDSS data item from a factorized token.
-
-    Returns a dict with keys: ``lu_nnz`` (int64[1]), ``npivots`` (int32[1]),
-    ``inertia`` (int32[2], cuDSS's own, block-global), ``perm_reorder_row`` /
-    ``perm_reorder_col`` / ``perm_row`` / ``perm_col`` / ``perm_matching``
-    (int32[N]), ``diag`` (dtype[N]), ``scale_row`` / ``scale_col``
-    (float32[N]), ``nd_partition_tree`` (int32, cuDSS >= 0.8's successor to
-    the elimination tree), ``nsuperpanels`` (int32[1]), ``schur_shape``
-    (int64[2]) — where N is the full block-system dimension (batch * n).
-
-    Everything is returned unconditionally; items cuDSS declines for this
-    matrix type / reordering algorithm come back zero-filled. Requires a
-    factorized token.
-    """
     B = _batch_of(token)
     N = B * token.n
     tree = int(_ps.nd_partition_tree_size())
@@ -552,31 +691,30 @@ def query(token: FactorToken) -> dict:
 
 
 def inertia(data: dict, batch_size: int = 1):
-    """Per-block [positive, negative] LDL^T inertia from ``query`` output.
-
-    Pure function over the queried factorization data — do ``query`` once and
-    derive what you need from it::
-
-        data = query(token)
-        inr = inertia(data, batch_size=B)   # int32[B, 2]
-
-    Returns ``int32[2]`` for ``batch_size=1``, else ``int32[batch_size, 2]``
-    (the block dimension is inferred from ``diag``'s length).
+    """Per-block [positive, negative] LDL^T inertia from ``query`` output. CuDSS
+    doesnt yet reliably return 0 eigenvalues as of 0.8.
     """
     diag = data["diag"]
     diag_real = diag.real if jnp.iscomplexobj(diag) else diag
     n = diag.shape[0] // batch_size
-    result = compute_inertia_from_diag(diag_real, batch_size, n)
+
+    out = diag_real.reshape([batch_size, n])
+
+    # cuDSS pivoting threshold seems to be 1e-13. everything above this on
+    # plus or minus side seems to reliably indicate that particular inertia value.
+    threshold = 1e-13
+    positive = jnp.sum(out >= threshold, axis=1)
+    negative = jnp.sum(out <= -threshold, axis=1)
+
+    result = jnp.stack([positive, negative], axis=1, dtype=jnp.int32)
+
     return result if batch_size > 1 else result[0]
 
 
 # registry escape hatches ======================================================
 def release(token: FactorToken) -> bool:
-    """Eagerly free the registry entry behind ``token`` (outside jit only).
-
-    Returns True if an entry was freed, False if it was already gone. Entries
-    are otherwise LRU-evicted (capacity ``SPINEAX_FACTOR_CACHE``, default 8).
-    """
+    """manually free registry (only outside jit - otherwise whenever LRU overflows
+    according to SPINEAX_FACTOR_CACHE)"""
     return bool(_ps.token_release(int(jax.device_get(token.id).ravel()[0])))
 
 
@@ -591,9 +729,6 @@ def cache_capacity() -> int:
 
 
 # lineax front door — the default user-facing API =============================
-# An operator + solver pair over the token machinery above. lineax's protocol
-# (init/compute) drives it like any built-in solver, and the cuDSS phases are
-# ALSO explicit token-threading methods for full control (IPM/Newton loops).
 
 class CSRSymmetricOperator(lx.AbstractLinearOperator):
     """A symmetric matrix in CSR form (full pattern, values as the one leaf).
@@ -703,13 +838,6 @@ class CuDSS(lx.AbstractLinearSolver):
         return solve(token, vector)
 
     def query(self, token):
-        """Every cuDSS data item of this factorization, as one dict.
-
-        Same contract as the free function ``query``: everything returned
-        unconditionally (zero-filled where cuDSS declines), eager/outer
-        level. Derive what you need from it — e.g. per-block inertia via
-        ``inertia(solver.query(token), batch_size=B)``.
-        """
         return query(token)
 
     # lineax protocol ----------------------------------------------------

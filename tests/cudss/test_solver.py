@@ -551,6 +551,207 @@ def test_query_before_factorize_raises():
         jax.block_until_ready(cudss.query(token))
 
 
+# autodiff through the raw explicit phases ====================================
+def test_grad_raw_explicit_phases():
+    """jax.grad through analyze -> factorize -> solve, no lineax, no manual
+    custom_vjp: the numeric phases pass the values tangent through and
+    solve's built-in vjp does the implicit-function-theorem math. Upper
+    triangular storage: one stored entry (i, j) is BOTH A_ij and A_ji."""
+    _require_gpu()
+    n = 20
+    values, offsets, columns, _ = _sym_system(n=n, seed=14)
+    b = jnp.asarray(np.random.default_rng(24).standard_normal(n))
+    rows = jnp.repeat(jnp.arange(n), jnp.diff(offsets))
+
+    def loss(vals, b):
+        t = cudss.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, vals)
+        return jnp.sum(cudss.solve(t, b) ** 2)
+
+    gv, gb = jax.jit(jax.grad(loss, argnums=(0, 1)))(values, b)
+
+    def dense_loss(vals, b):
+        U = jnp.zeros((n, n)).at[rows, columns].set(vals)
+        A = U + U.T - jnp.diag(jnp.diag(U))
+        return jnp.sum(jnp.linalg.solve(A, b) ** 2)
+
+    gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(values, b)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
+                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
+                               rtol=1e-9, atol=1e-9)
+
+
+def test_grad_raw_full_view_and_batch():
+    """Gradient conventions for full-pattern storage and the explicit batch
+    door (block-diagonal gather path), against dense references."""
+    _require_gpu()
+    import jax.experimental.sparse as jsparse
+
+    n = 12
+    *_, A = _sym_system(n=n, seed=15)
+    sp = jsparse.BCSR.fromdense(jnp.asarray(A))
+    rows = jnp.repeat(jnp.arange(n), jnp.diff(sp.indptr))
+    b = jnp.asarray(np.random.default_rng(25).standard_normal(n))
+
+    # full view (mview 0): every stored entry is one independent A_ij
+    def loss(vals, b):
+        t = cudss.analyze(vals, sp.indptr, sp.indices, mtype_id=1, mview_id=0)
+        t = cudss.factorize(t, vals)
+        return jnp.sum(cudss.solve(t, b) ** 2)
+
+    gv = jax.grad(loss)(sp.data, b)
+
+    def dense_loss(vals, b):
+        Ad = jnp.zeros((n, n)).at[rows, sp.indices].set(vals)
+        return jnp.sum(jnp.linalg.solve(Ad, b) ** 2)
+
+    gv_d = jax.grad(dense_loss)(sp.data, b)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
+                               rtol=1e-9, atol=1e-9)
+
+    # explicit batch door: per-block gradients through ONE block solve
+    vals_batch = jnp.stack([sp.data, sp.data * 2.0])
+    b_batch = jnp.stack([b, b * 3.0])
+
+    def batch_loss(vals, bb):
+        t = cudss.analyze(vals, sp.indptr, sp.indices, mtype_id=1, mview_id=0)
+        t = cudss.factorize(t, vals)
+        return jnp.sum(cudss.solve(t, bb) ** 2)
+
+    gv_b, gb_b = jax.jit(jax.grad(batch_loss, argnums=(0, 1)))(
+        vals_batch, b_batch)
+
+    def dense_batch_loss(vals, bb):
+        out = 0.0
+        for k in range(2):
+            Ad = jnp.zeros((n, n)).at[rows, sp.indices].set(vals[k])
+            out = out + jnp.sum(jnp.linalg.solve(Ad, bb[k]) ** 2)
+        return out
+
+    gv_bd, gb_bd = jax.grad(dense_batch_loss, argnums=(0, 1))(
+        vals_batch, b_batch)
+    np.testing.assert_allclose(np.asarray(gv_b), np.asarray(gv_bd),
+                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb_b), np.asarray(gb_bd),
+                               rtol=1e-9, atol=1e-9)
+
+
+def test_grad_general_mtype():
+    """Reverse mode through a GENERAL (mtype 0) solve: cuDSS has no
+    transpose solve, so the backward pass factorizes A^T on the fly."""
+    _require_gpu()
+    n = 12
+    rng = np.random.default_rng(26)
+    A = rng.standard_normal((n, n)) + n * np.eye(n)  # nonsymmetric
+    columns = jnp.asarray(np.tile(np.arange(n, dtype=np.int32), n))
+    offsets = jnp.asarray(np.arange(n + 1, dtype=np.int32) * n)
+    rows = jnp.repeat(jnp.arange(n), n)
+    vals = jnp.asarray(A.reshape(-1))
+    b = jnp.asarray(rng.standard_normal(n))
+
+    def loss(v, b):
+        t = cudss.analyze(v, offsets, columns, mtype_id=0, mview_id=0)
+        t = cudss.factorize(t, v)
+        return jnp.sum(cudss.solve(t, b) ** 2)
+
+    gv, gb = jax.jit(jax.grad(loss, argnums=(0, 1)))(vals, b)
+
+    def dense_loss(v, b):
+        Ad = jnp.zeros((n, n)).at[rows, columns].set(v)
+        return jnp.sum(jnp.linalg.solve(Ad, b) ** 2)
+
+    gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
+                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
+                               rtol=1e-9, atol=1e-9)
+
+
+def test_grad_hermitian_complex():
+    """Reverse mode through a hermitian (mtype 2) complex solve: the adjoint
+    reuses the forward factors via A^T x = c <=> x = conj(A^-1 conj(c))."""
+    _require_gpu()
+    n = 12
+    rng = np.random.default_rng(27)
+    H = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    H = H + H.conj().T + 2 * n * np.eye(n)
+    mask = np.triu(np.ones((n, n), bool))
+    offsets = jnp.asarray(
+        np.concatenate([[0], np.cumsum(mask.sum(1))]).astype(np.int32))
+    columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
+    rows = jnp.asarray(np.nonzero(mask)[0])
+    vals = jnp.asarray(H[mask])
+    b = jnp.asarray(rng.standard_normal(n) + 1j * rng.standard_normal(n))
+
+    def loss(v, b):
+        t = cudss.analyze(v, offsets, columns, mtype_id=2, mview_id=1)
+        t = cudss.factorize(t, v)
+        return jnp.sum(jnp.abs(cudss.solve(t, b)) ** 2)
+
+    gv, gb = jax.jit(jax.grad(loss, argnums=(0, 1)))(vals, b)
+
+    def dense_loss(v, b):
+        # the stored diagonal is A_ii AS-IS (real for hermitian input);
+        # subtracting diag(conj(U)) keeps that convention in the reference
+        U = jnp.zeros((n, n), jnp.complex128).at[rows, columns].set(v)
+        Ad = U + U.conj().T - jnp.diag(jnp.diag(U).conj())
+        return jnp.sum(jnp.abs(jnp.linalg.solve(Ad, b)) ** 2)
+
+    gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
+                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
+                               rtol=1e-9, atol=1e-9)
+
+
+def test_higher_order_derivatives():
+    """Arbitrary-order differentiation: custom_linear_solve's rules recurse,
+    the numeric-phase identity rules recurse, and the solve vmap rule
+    recurses (jacfwd-of-grad nests one vmap per order onto the FFI call).
+    Hessian, reverse-over-reverse and third order against dense refs."""
+    _require_gpu()
+    n = 10
+    values, offsets, columns, _ = _sym_system(n=n, seed=28)
+    b = jnp.asarray(np.random.default_rng(29).standard_normal(n))
+    rows = jnp.repeat(jnp.arange(n), jnp.diff(offsets))
+
+    def loss(v, b):
+        t = cudss.analyze(v, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, v)
+        return jnp.sum(cudss.solve(t, b) ** 2)
+
+    def dense_loss(v, b):
+        U = jnp.zeros((n, n)).at[rows, columns].set(v)
+        A = U + U.T - jnp.diag(jnp.diag(U))
+        return jnp.sum(jnp.linalg.solve(A, b) ** 2)
+
+    # forward-over-reverse (jax.hessian), wrt values and wrt b
+    Hv = jax.jit(jax.hessian(loss))(values, b)
+    Hv_d = jax.hessian(dense_loss)(values, b)
+    np.testing.assert_allclose(np.asarray(Hv), np.asarray(Hv_d),
+                               rtol=1e-8, atol=1e-8)
+    Hb = jax.jit(jax.hessian(loss, argnums=1))(values, b)
+    Hb_d = jax.hessian(dense_loss, argnums=1)(values, b)
+    np.testing.assert_allclose(np.asarray(Hb), np.asarray(Hb_d),
+                               rtol=1e-8, atol=1e-8)
+
+    # reverse-over-reverse
+    gg = jax.grad(lambda bb: jax.grad(loss, argnums=1)(values, bb).sum())(b)
+    gg_d = jax.grad(
+        lambda bb: jax.grad(dense_loss, argnums=1)(values, bb).sum())(b)
+    np.testing.assert_allclose(np.asarray(gg), np.asarray(gg_d),
+                               rtol=1e-9, atol=1e-9)
+
+    # third order along a direction, values entering through factorize
+    dv = jnp.asarray(np.random.default_rng(31).standard_normal(values.shape))
+    d3 = jax.grad(jax.grad(jax.grad(
+        lambda s: loss(values + s * dv, b))))(0.0)
+    d3_d = jax.grad(jax.grad(jax.grad(
+        lambda s: dense_loss(values + s * dv, b))))(0.0)
+    np.testing.assert_allclose(float(d3), float(d3_d), rtol=1e-7)
+
+
 # lineax adapter (the default user API, defined in solver.py) ================
 def test_lineax_adapter():
     import lineax as lx
