@@ -2,6 +2,12 @@
 requires = [
     "scikit-build-core >= 0.5",
     "nanobind",
+    # Needed only when building from source under build isolation (e.g. an sdist
+    # fallback when no wheel matches): CMake reads the XLA FFI headers from jaxlib
+    # and compiles against cudss.h + the CUDA runtime headers. These are ignored
+    # under --no-build-isolation (the build then uses the active environment).
+    "jax[cuda13]>=0.8.0",
+    "nvidia-cudss-cu13>=0.8.0",
 ]
 build-backend = "scikit_build_core.build"
 

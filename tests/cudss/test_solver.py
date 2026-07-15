@@ -802,12 +802,16 @@ def test_lineax_adapter():
     import jax.experimental.sparse as jsparse
 
     sp = jsparse.BCSR.fromdense(jnp.asarray(A))
-    operator = cudss.CSRSymmetricOperator(sp.data, sp.indptr, sp.indices)
+    operator = cudss.CSROperator(sp.data, sp.indptr, sp.indices,
+                                 lx.symmetric_tag)
+    assert lx.is_symmetric(operator)
+    assert operator.transpose() is operator
     solver = cudss.CuDSS()
     b = jnp.asarray(np.random.default_rng(23).standard_normal(A.shape[0]))
 
-    # explicit phases incl. query
+    # explicit phases incl. query; symmetric tag resolves to mtype 1 (LDL)
     token = solver.analyze(operator)
+    assert token.mtype_id == 1
     token = solver.factorize(token, operator)
     x = solver.solve(token, b)
     assert _rel_err(A, x, b) < 1e-10
@@ -822,6 +826,54 @@ def test_lineax_adapter():
     sol = lx.linear_solve(operator, b, solver)
     assert _rel_err(A, sol.value, b) < 1e-10
     assert cudss.release(sol.state) is True
+
+
+def test_lineax_general_operator():
+    """Untagged CSROperator = general (mtype 0): transpose is a real CSR
+    transpose, and gradients through lx.linear_solve pay for one transposed
+    factorization in the backward pass (no cuDSS transpose solve)."""
+    import lineax as lx
+    import jax.experimental.sparse as jsparse
+
+    _require_gpu()
+    n = 12
+    rng = np.random.default_rng(33)
+    A = rng.standard_normal((n, n)) + n * np.eye(n)  # nonsymmetric
+    sp = jsparse.BCSR.fromdense(jnp.asarray(A))
+    b = jnp.asarray(rng.standard_normal(n))
+    solver = cudss.CuDSS()
+
+    operator = cudss.CSROperator(sp.data, sp.indptr, sp.indices)
+    assert not lx.is_symmetric(operator)
+    np.testing.assert_allclose(np.asarray(operator.transpose().as_matrix()),
+                               np.asarray(A).T, rtol=1e-15)
+
+    token = solver.analyze(operator)
+    assert token.mtype_id == 0
+    sol = lx.linear_solve(operator, b, solver)
+    np.testing.assert_allclose(np.asarray(sol.value),
+                               np.linalg.solve(np.asarray(A), np.asarray(b)),
+                               rtol=1e-9)
+    cudss.release(sol.state)
+
+    # gradient through lx.linear_solve (exercises solver.transpose -> A^T
+    # factorization) vs dense reference
+    def loss(vals, bb):
+        op = cudss.CSROperator(vals, sp.indptr, sp.indices)
+        return jnp.sum(lx.linear_solve(op, bb, solver).value ** 2)
+
+    gv, gb = jax.grad(loss, argnums=(0, 1))(sp.data, b)
+    rows = jnp.repeat(jnp.arange(n), jnp.diff(sp.indptr))
+
+    def dense_loss(vals, bb):
+        Ad = jnp.zeros((n, n)).at[rows, sp.indices].set(vals)
+        return jnp.sum(jnp.linalg.solve(Ad, bb) ** 2)
+
+    gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(sp.data, b)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
+                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
+                               rtol=1e-9, atol=1e-9)
 
 
 # lifetime =====================================================================

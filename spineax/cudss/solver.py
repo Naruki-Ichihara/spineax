@@ -630,6 +630,20 @@ def _matvec(token, x):
     return y.reshape(x.shape)
 
 
+def _transpose_csr(values, offsets, columns):
+    """(values, offsets, columns) of ``A^T`` for one flat CSR system:
+    the CSR of the transpose IS the CSC of A, obtained by a stable
+    reorder of the entries by (column, row). On-device jnp ops."""
+    n = offsets.shape[0] - 1
+    rows = _pattern_rows(offsets, columns.shape[-1])
+    order = jnp.lexsort((rows, columns))
+    t_offsets = jnp.concatenate([
+        jnp.zeros((1,), jnp.int32),
+        jnp.cumsum(jnp.zeros((n,), jnp.int32).at[columns].add(1),
+                   dtype=jnp.int32)])
+    return values[order], t_offsets, rows[order]
+
+
 def _transpose_solve_general(token, rhs, nsteps):
     """``A^-T rhs`` for a general (mtype 0) token.
 
@@ -641,15 +655,9 @@ def _transpose_solve_general(token, rhs, nsteps):
     """
     B = _batch_of(token)
     offs_bd, cols_bd, _ = _expand_structure(token.offsets, token.columns, B)
-    N = offs_bd.shape[0] - 1
-    rows_bd = _pattern_rows(offs_bd, B * token.nnz)
-    vals = token.values.reshape(-1)
-    order = jnp.lexsort((rows_bd, cols_bd))  # CSR of A^T = CSC of A
-    t_offsets = jnp.concatenate([
-        jnp.zeros((1,), jnp.int32),
-        jnp.cumsum(jnp.zeros((N,), jnp.int32).at[cols_bd].add(1),
-                   dtype=jnp.int32)])
-    t_token = analyze(vals[order], t_offsets, rows_bd[order],
+    t_vals, t_offs, t_cols = _transpose_csr(token.values.reshape(-1),
+                                            offs_bd, cols_bd)
+    t_token = analyze(t_vals, t_offs, t_cols,
                       mtype_id=0, mview_id=0, device_id=token.device_id)
     t_token = factorize(t_token, t_token.values)
     rf = rhs.reshape(rhs.shape[:-2] + (-1,)) if B > 1 else rhs
@@ -764,17 +772,37 @@ def cache_capacity() -> int:
 
 # lineax front door — the default user-facing API ==============================
 
-class CSRSymmetricOperator(lx.AbstractLinearOperator):
-    """A symmetric matrix in CSR form (full pattern, values as the one leaf).
+class CSROperator(lx.AbstractLinearOperator):
+    """A square matrix in CSR form (full pattern; values as the one leaf).
 
-    Stores the FULL sparsity pattern (both triangles) so ``mv`` is a plain
-    BCSR matvec; cuDSS accepts a full view (``mview_id=0``) with a symmetric
-    mtype. The arrays are referenced zero-copy, same as everywhere else.
+    Structure is declared lineax-style via TAGS, not subclasses — exactly
+    like ``lx.MatrixLinearOperator(matrix, lx.symmetric_tag)`` for dense:
+
+        CSROperator(vals, offs, cols)                       # general
+        CSROperator(vals, offs, cols, lx.symmetric_tag)     # symmetric
+        CSROperator(vals, offs, cols,
+                    (lx.symmetric_tag,
+                     lx.positive_semidefinite_tag))         # SPD
+
+    Always the FULL sparsity pattern (both triangles; cuDSS ``mview_id=0``):
+    ``mv`` is a plain BCSR matvec and a general matrix has no triangular
+    shorthand anyway. The arrays are referenced zero-copy, same as
+    everywhere else.
     """
 
     values: Array
     offsets: Array
     columns: Array
+    tags: frozenset = eqx.field(static=True)
+
+    def __init__(self, values, offsets, columns, tags=()):
+        self.values = values
+        self.offsets = offsets
+        self.columns = columns
+        if isinstance(tags, (tuple, list, set, frozenset)):
+            self.tags = frozenset(tags)
+        else:
+            self.tags = frozenset({tags})
 
     def _bcsr(self):
         n = self.offsets.shape[0] - 1
@@ -788,7 +816,12 @@ class CSRSymmetricOperator(lx.AbstractLinearOperator):
         return self._bcsr().todense()
 
     def transpose(self):
-        return self  # symmetric
+        if lx.symmetric_tag in self.tags:
+            return self
+        t_vals, t_offs, t_cols = _transpose_csr(self.values, self.offsets,
+                                                self.columns)
+        return CSROperator(t_vals, t_offs, t_cols,
+                           lx.transpose_tags(self.tags))
 
     def in_structure(self):
         n = self.offsets.shape[0] - 1
@@ -798,31 +831,48 @@ class CSRSymmetricOperator(lx.AbstractLinearOperator):
         return self.in_structure()
 
 
-# lineax dispatches these predicates by operator class
-@lx.is_symmetric.register(CSRSymmetricOperator)
-def _(operator):
-    return True
+# lineax dispatches these predicates by operator class; each reads its tag,
+# mirroring how lx.MatrixLinearOperator + tags behaves for dense matrices
+for _predicate, _tag in (
+    (lx.is_symmetric, lx.symmetric_tag),
+    (lx.is_diagonal, lx.diagonal_tag),
+    (lx.is_tridiagonal, lx.tridiagonal_tag),
+    (lx.is_lower_triangular, lx.lower_triangular_tag),
+    (lx.is_upper_triangular, lx.upper_triangular_tag),
+    (lx.is_positive_semidefinite, lx.positive_semidefinite_tag),
+    (lx.is_negative_semidefinite, lx.negative_semidefinite_tag),
+    (lx.has_unit_diagonal, lx.unit_diagonal_tag),
+):
+    _predicate.register(CSROperator)(
+        lambda operator, _tag=_tag: _tag in operator.tags)
 
 
-@lx.linearise.register(CSRSymmetricOperator)
-@lx.materialise.register(CSRSymmetricOperator)
+@lx.linearise.register(CSROperator)
+@lx.materialise.register(CSROperator)
 def _(operator):
     return operator
 
 
-@lx.conj.register(CSRSymmetricOperator)
+@lx.conj.register(CSROperator)
 def _(operator):
-    return operator  # real-valued
-
-
-for _predicate in (lx.is_diagonal, lx.is_tridiagonal, lx.is_lower_triangular,
-                   lx.is_upper_triangular, lx.is_positive_semidefinite,
-                   lx.is_negative_semidefinite, lx.has_unit_diagonal):
-    _predicate.register(CSRSymmetricOperator)(lambda operator: False)
+    return CSROperator(jnp.conj(operator.values), operator.offsets,
+                       operator.columns, operator.tags)
 
 
 class CuDSS(lx.AbstractLinearSolver):
-    """lineax front door for the token API (symmetric matrices).
+    """lineax front door for the token API.
+
+    The cuDSS matrix type is resolved from the OPERATOR'S TAGS, the same
+    way lineax's own solvers consult ``lx.is_symmetric`` etc.:
+
+        symmetric + positive_semidefinite  ->  mtype 3 (Cholesky)
+        symmetric                          ->  mtype 1 (LDL^T)
+        untagged                           ->  mtype 0 (general LU)
+
+    General operators are fully supported, gradients included — with the
+    documented cost that anything needing ``A^T`` (lineax's backward pass,
+    ``solver.transpose``) must factorize the transpose from scratch, since
+    cuDSS has no transpose solve (design doc section 8).
 
     lineax's phase boundary is operator-dependent vs vector-dependent work
     (``lx.Cholesky.init`` runs ``cho_factor``; ``compute`` runs
@@ -853,14 +903,15 @@ class CuDSS(lx.AbstractLinearSolver):
         data   = solver.query(token)                      # every cuDSS data item
     """
 
-    mtype_id: int = eqx.field(static=True, default=1)
-    mview_id: int = eqx.field(static=True, default=0)
-
     # explicit phases ----------------------------------------------------------
 
     def analyze(self, operator):
+        if lx.is_symmetric(operator):
+            mtype_id = 3 if lx.is_positive_semidefinite(operator) else 1
+        else:
+            mtype_id = 0
         return analyze(operator.values, operator.offsets, operator.columns,
-                       mtype_id=self.mtype_id, mview_id=self.mview_id)
+                       mtype_id=mtype_id, mview_id=0)
 
     def factorize(self, token, operator):
         return factorize(token, operator.values)
@@ -887,10 +938,19 @@ class CuDSS(lx.AbstractLinearSolver):
         return unflatten(solution), lx.RESULTS.successful, {}
 
     def transpose(self, state, options):
-        return state, options  # symmetric: A^T shares the factorization
+        if state.mtype_id in (1, 3):
+            return state, options  # A^T = A: same factorization
+        # general: cuDSS has no transpose solve, so lineax's backward pass
+        # pays for a fresh factorization of A^T (one analyze+factorize+
+        # registry entry), mirroring the raw autodiff path
+        t_vals, t_offs, t_cols = _transpose_csr(state.values, state.offsets,
+                                                state.columns)
+        t_token = analyze(t_vals, t_offs, t_cols,
+                          mtype_id=0, mview_id=0, device_id=state.device_id)
+        return factorize(t_token, t_token.values), options
 
     def conj(self, state, options):
-        return state, options  # real
+        return state, options  # real-valued operators
 
     def assume_full_rank(self):
         return True

@@ -1,7 +1,7 @@
 """cuDSS-backed sparse direct solves for JAX (see spineax.cudss.solver)."""
 
 from spineax.cudss.solver import (
-    CSRSymmetricOperator,
+    CSROperator,
     CuDSS,
     FactorToken,
     analyze,
@@ -16,7 +16,7 @@ from spineax.cudss.solver import (
 )
 
 __all__ = [
-    "CSRSymmetricOperator",
+    "CSROperator",
     "CuDSS",
     "FactorToken",
     "analyze",

@@ -1,6 +1,6 @@
 """Example: spineax's default user API — the lineax solver.
 
-``CSRSymmetricOperator`` + ``CuDSS`` (both part of
+``CSROperator`` + ``CuDSS`` (both part of
 ``spineax.cudss``, defined in solver.py next to the token machinery they
 wrap) give two interoperating styles:
 
@@ -21,7 +21,7 @@ import jax.experimental.sparse as jsparse
 import lineax as lx
 
 from spineax import cudss
-from spineax.cudss import CSRSymmetricOperator, CuDSS
+from spineax.cudss import CSROperator, CuDSS
 
 jax.config.update("jax_enable_x64", True)
 
@@ -38,7 +38,7 @@ def test_lineax_solver():
     sp = jsparse.BCSR.fromdense(dense)
     b = jax.random.normal(key, (n,), dtype=jnp.float64)
 
-    operator = CSRSymmetricOperator(sp.data, sp.indptr, sp.indices)
+    operator = CSROperator(sp.data, sp.indptr, sp.indices, lx.symmetric_tag)
     solver = CuDSS()
 
     # explicit phase style: each cuDSS phase is a method call, and the
@@ -85,7 +85,7 @@ def test_lineax_solver():
     # Newton-style value update: refactorize reuses the pivot order and the
     # analysis from the explicit token — no re-analyze, no new registry entry
     new_values = sp.data * 2.0
-    new_operator = CSRSymmetricOperator(new_values, sp.indptr, sp.indices)
+    new_operator = CSROperator(new_values, sp.indptr, sp.indices, lx.symmetric_tag)
     token = solver.refactorize(token, new_operator)
     x2 = solver.solve(token, b)
     err = jnp.max(jnp.abs(new_operator.mv(x2) - b))
@@ -99,7 +99,7 @@ def test_lineax_solver():
     # cannot be released eagerly — the LRU evicts them as they age out.
     @jax.jit
     def loss(values):
-        op = CSRSymmetricOperator(values, sp.indptr, sp.indices)
+        op = CSROperator(values, sp.indptr, sp.indices, lx.symmetric_tag)
         x = lx.linear_solve(op, b, solver).value
         return jnp.sum(x ** 2)
 
