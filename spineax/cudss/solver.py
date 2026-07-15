@@ -223,42 +223,158 @@ def _batch_of(token: FactorToken) -> int:
 # raw FFI calls ================================================================
 # Every call hands the (expanded) structure and values over as arguments, so
 # cuDSS reads live XLA buffers only — the entry owns no CSR data (zero-copy).
+#
+# spineax emits its XLA custom calls itself instead of via jax.ffi.ffi_call:
+# the handlers in solver.cpp implement the TYPED FFI contract (custom-call
+# api_version 4), and that version is stated EXPLICITLY on every emitted op.
+# jax.ffi.ffi_call instead lowers typed calls as api_version=1 plus an
+# `mhlo.backend_config` side-attribute (jax's dict-backend_config workaround)
+# and trusts XLA's StableHLO->HLO import to restore the typed version — a
+# restoration observed NOT to happen on large modules (IPM-solver scale:
+# every spineax call imported as a LEGACY custom call and compilation failed
+# with "No registered implementation ... for platform CUDA"). Explicit
+# emission removes that round-trip and pins the ABI: if jax/XLA ever move to
+# an api_version 5 default, spineax still declares — and is dispatched at —
+# the version its handlers are compiled for.
+#
+# Deliberately NO jax._src imports here. Everything comes from surfaces with
+# a stability story: jax.extend (documented deprecation policy),
+# jax.interpreters.mlir.register_lowering (the ecosystem-wide extension
+# point), jaxlib's MLIR/StableHLO python bindings, and public tracing — the
+# FFI effect instance and the aval class are EXTRACTED from a traced
+# jax.ffi.ffi_call probe rather than imported by their private names.
+# test_explicit_typed_ffi_api_version fails loudly if a jax upgrade moves
+# any of this.
+from jax.extend.mlir import ir as _ir
+from jax.interpreters import mlir as _jmlir
+from jaxlib.mlir.dialects import stablehlo as _stablehlo
+
+_FFI_API_VERSION = 4  # typed FFI: the contract solver.cpp's handlers compile
+
+
+def _ffi_probe_jaxpr():
+    """Trace (never run) a jax.ffi call to harvest jax's own FFI machinery:
+    the effect instance (already in jax's control-flow allowlists, so our
+    calls are while/cond-legal exactly like jax.ffi ones) and the concrete
+    aval class — by value, not by private-module name."""
+    fn = jax.ffi.ffi_call("__spineax_probe", jax.ShapeDtypeStruct((1,), jnp.int32),
+                          has_side_effect=True)
+    return jax.make_jaxpr(lambda: fn())()
+
+
+_probe = _ffi_probe_jaxpr()
+(_SPINEAX_FFI_EFFECT,) = tuple(_probe.effects)
+_ShapedArray = type(_probe.out_avals[0])
+
+_ffi_p = jax.extend.core.Primitive("spineax_ffi")
+_ffi_p.multiple_results = True
+
+
+@lru_cache(maxsize=None)
+def _ffi_eager(name, out_avals, attrs):
+    # eager binds execute through jit (one compiled call per unique config)
+    return jax.jit(lambda *a: _ffi_p.bind(*a, name=name, out_avals=out_avals,
+                                          attrs=attrs))
+
+
+_ffi_p.def_impl(lambda *args, name, out_avals, attrs:
+                _ffi_eager(name, out_avals, attrs)(*args))
+
+
+@_ffi_p.def_effectful_abstract_eval
+def _ffi_abstract_eval(*avals_in, name, out_avals, attrs):
+    del avals_in, name, attrs
+    return list(out_avals), {_SPINEAX_FFI_EFFECT}
+
+
+def _ir_tensor_type(aval):
+    dt = jnp.dtype(aval.dtype)
+    if dt == jnp.float32:      et = _ir.F32Type.get()
+    elif dt == jnp.float64:    et = _ir.F64Type.get()
+    elif dt == jnp.complex64:  et = _ir.ComplexType.get(_ir.F32Type.get())
+    elif dt == jnp.complex128: et = _ir.ComplexType.get(_ir.F64Type.get())
+    elif dt == jnp.int32:      et = _ir.IntegerType.get_signless(32)
+    elif dt == jnp.int64:      et = _ir.IntegerType.get_signless(64)
+    elif dt == jnp.uint32:     et = _ir.IntegerType.get_unsigned(32)
+    else:
+        raise ValueError(f"spineax ffi: unhandled dtype {dt}")
+    return _ir.RankedTensorType.get(aval.shape, et)
+
+
+def _ffi_lowering(ctx, *operands, name, out_avals, attrs):
+    del out_avals  # ctx.avals_out is authoritative
+    # Build the stablehlo.custom_call directly: the TYPED_FFI form is
+    # api_version=4 with a DICTIONARY backend_config (the stablehlo verifier
+    # enforces this), which jax's mlir.custom_call helper cannot express —
+    # its dict branch is what rewrites to api_version=1 + mhlo.backend_config.
+    i64 = _ir.IntegerType.get_signless(64)
+
+    def _layout(a):  # row-major, minor-to-major order (as the FFI expects)
+        return _ir.DenseIntElementsAttr.get(
+            np.atleast_1d(np.asarray(tuple(reversed(range(a.ndim))), np.int64)),
+            type=_ir.IndexType.get())
+
+    attributes = dict(
+        call_target_name=_ir.StringAttr.get(name),
+        has_side_effect=_ir.BoolAttr.get(True),
+        backend_config=_ir.DictAttr.get(
+            {k: _ir.IntegerAttr.get(i64, int(v)) for k, v in attrs}),
+        api_version=_ir.IntegerAttr.get(
+            _ir.IntegerType.get_signless(32), _FFI_API_VERSION),
+        called_computations=_ir.ArrayAttr.get([]),
+        operand_layouts=_ir.ArrayAttr.get(
+            [_layout(a) for a in ctx.avals_in]),
+        result_layouts=_ir.ArrayAttr.get(
+            [_layout(a) for a in ctx.avals_out]),
+    )
+    op = _stablehlo.CustomCallOp.build_generic(
+        results=[_ir_tensor_type(a) for a in ctx.avals_out],
+        operands=list(operands),
+        attributes=attributes,
+    )
+    return op.results
+
+
+_jmlir.register_lowering(_ffi_p, _ffi_lowering)
+
+
+def _ffi_call4(name, out_specs, *operands, **attrs):
+    """Emit one spineax typed-FFI custom call (explicit api_version 4).
+
+    ``out_specs`` is a tuple of ShapeDtypeStructs; returns a list of arrays.
+    Integer ``attrs`` become i64 FFI attributes (solver.cpp Attr<int64_t>).
+    """
+    out_avals = tuple(_ShapedArray(s.shape, jnp.dtype(s.dtype))
+                      for s in out_specs)
+    return _ffi_p.bind(*operands, name=name, out_avals=out_avals,
+                       attrs=tuple(sorted(attrs.items())))
+
+
 def _ffi_analyze(values, offsets_bd, columns_bd, fingerprint, *, batch_size,
                  device_id, mtype_id, mview_id):
-    fn = jax.ffi.ffi_call(
+    (token_id,) = _ffi_call4(
         f"spineax_token_analyze_{_suffix(values.dtype)}",
-        jax.ShapeDtypeStruct((1,), jnp.int32),
-        has_side_effect=True,
-    )
-    return fn(
-        values,
-        offsets_bd,
-        columns_bd,
-        fingerprint,
-        batch_size=batch_size,
-        device_id=device_id,
-        mtype_id=mtype_id,
-        mview_id=mview_id,
-    )
+        (jax.ShapeDtypeStruct((1,), jnp.int32),),
+        values, offsets_bd, columns_bd, fingerprint,
+        batch_size=batch_size, device_id=device_id,
+        mtype_id=mtype_id, mview_id=mview_id)
+    return token_id
 
 
 def _ffi_numeric(token_id, offsets_bd, columns_bd, fingerprint, values, *, op):
-    fn = jax.ffi.ffi_call(
+    (out_id,) = _ffi_call4(
         f"spineax_token_{op}_{_suffix(values.dtype)}",
-        jax.ShapeDtypeStruct(token_id.shape, jnp.int32),  # token (same ids)
-        has_side_effect=True,
-    )
-    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, _ir_off())
+        (jax.ShapeDtypeStruct(token_id.shape, jnp.int32),),  # token (same ids)
+        token_id, offsets_bd, columns_bd, fingerprint, values, _ir_off())
+    return out_id
 
 
 def _ffi_solve(token_id, offsets_bd, columns_bd, fingerprint, values, b):
-    fn = jax.ffi.ffi_call(
+    (x,) = _ffi_call4(
         f"spineax_token_solve_{_suffix(b.dtype)}",
-        jax.ShapeDtypeStruct(b.shape, b.dtype),
-        has_side_effect=True,
-    )
-    return fn(token_id, offsets_bd, columns_bd, fingerprint, values, b,
-              _ir_off())
+        (jax.ShapeDtypeStruct(b.shape, b.dtype),),
+        token_id, offsets_bd, columns_bd, fingerprint, values, b, _ir_off())
+    return x
 
 
 # vmap-aware wrappers over the single (B=1) view ===============================
@@ -700,7 +816,7 @@ def _make_query(suffix, dtype, n, tree):
 
     @jax.custom_batching.custom_vmap
     def query_id(token_id):
-        fn = jax.ffi.ffi_call(
+        outs = _ffi_call4(
             f"spineax_token_query_{suffix}",
             (
                 jax.ShapeDtypeStruct((1,), jnp.int64),        # lu_nnz
@@ -718,9 +834,8 @@ def _make_query(suffix, dtype, n, tree):
                 jax.ShapeDtypeStruct((1,), jnp.int32),        # nsuperpanels
                 jax.ShapeDtypeStruct((2,), jnp.int64),        # schur_shape
             ),
-            has_side_effect=True,
-        )
-        return tuple(fn(token_id))
+            token_id)
+        return tuple(outs)
 
     @query_id.def_vmap
     def _(axis_size, in_batched, token_id):

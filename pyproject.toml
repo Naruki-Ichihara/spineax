@@ -13,7 +13,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "spineax"
-version = "0.0.2"
+version = "0.0.3"
 # nanobind's stable ABI (STABLE_ABI in CMakeLists.txt) needs CPython >= 3.12.
 # One cp312-abi3 wheel then covers 3.12, 3.13, 3.14, ...
 requires-python = ">=3.12"
