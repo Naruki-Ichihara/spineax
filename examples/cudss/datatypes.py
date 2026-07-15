@@ -1,4 +1,4 @@
-"""Example: the token API supports f32/f64/c64/c128."""
+"""Example: the API supports f32/f64/c64/c128."""
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse

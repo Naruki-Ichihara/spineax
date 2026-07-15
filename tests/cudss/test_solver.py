@@ -393,6 +393,102 @@ def test_query_inertia_under_vmap():
     assert len(set(np.asarray(lu_nnz).ravel().tolist())) == 1
 
 
+def test_query_inertia_under_nested_vmap():
+    """Nested vmap composes: a (2, 2) heterogeneous batch is still ONE block
+    query, and the input-ordered fields unwind one axis per vmap level with
+    per-SYSTEM granularity (not per-outer-level)."""
+    _require_gpu()
+    n = 40
+    rng = np.random.default_rng(33)
+    blocks, expected = [], []
+    for i in range(4):  # heterogeneous: PD, indefinite, PD, indefinite
+        A = rng.standard_normal((n, n))
+        A = A + A.T + (n if i % 2 == 0 else 0.0) * np.eye(n)
+        eigs = np.linalg.eigvalsh(A)
+        expected.append([int((eigs > 0).sum()), int((eigs < 0).sum())])
+        blocks.append(A)
+    assert expected[0] != expected[1]
+
+    mask = np.triu(np.ones((n, n), dtype=bool))
+    columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
+    offsets = jnp.asarray(
+        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
+    vals = jnp.asarray(
+        np.stack([np.triu(A)[mask] for A in blocks])).reshape(2, 2, -1)
+
+    @jax.jit
+    @jax.vmap
+    @jax.vmap
+    def per_block(v):
+        t = cudss.analyze(v, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, v)
+        data = cudss.query(t)
+        return cudss.inertia(data), data["diag"], data["lu_nnz"]
+
+    inr, diag, lu_nnz = per_block(vals)
+    assert inr.shape == (2, 2, 2)
+    np.testing.assert_array_equal(np.asarray(inr).reshape(4, 2), expected)
+    assert diag.shape == (2, 2, n)  # split axis per level, per-system blocks
+    assert lu_nnz.shape == (2, 2, 1)  # block-global: broadcast at every level
+
+
+def test_explicit_batch_door_under_vmap():
+    """The explicit (B, nnz) door itself vmaps: the door routes through the
+    same custom_vmap wrapper, so an outer vmap peels into one
+    (B_outer * B)-block system instead of hitting the raw FFI."""
+    _require_gpu()
+    values, offsets, columns, A = _sym_system()
+    n = A.shape[0]
+    scales = jnp.asarray([[1.0, 2.0], [0.5, 4.0]])
+    vals = scales[..., None] * values  # (2, 2, nnz)
+    b = jnp.asarray(np.random.default_rng(22).standard_normal((2, 2, n)))
+
+    def solve_pair(v2, b2):  # v2: (2, nnz) — explicit batch door
+        t = cudss.analyze(v2, offsets, columns)
+        t = cudss.factorize(t, v2)
+        return cudss.solve(t, b2)
+
+    X = jax.vmap(solve_pair)(vals, b)
+    assert X.shape == (2, 2, n)
+    for i in range(2):
+        for j in range(2):
+            assert _rel_err(float(scales[i, j]) * np.asarray(A),
+                            X[i, j], b[i, j]) < 1e-10
+
+
+def test_grad_under_nested_vmap():
+    """Reverse mode composes through nested vmap: grads wrt values and rhs of
+    a (2, 2)-batched solve match the dense reference (the autodiff-added
+    axes peel through the same recursive rules as the system axes)."""
+    _require_gpu()
+    n = 12
+    values, offsets, columns, _ = _sym_system(n=n)
+    scales = jnp.asarray([[1.0, 2.0], [0.5, 4.0]], dtype=jnp.float64)
+    vals = scales[..., None] * values
+    b = jnp.asarray(np.random.default_rng(23).standard_normal((2, 2, n)))
+
+    def loss(vals, b):
+        def one(v, bb):
+            t = cudss.analyze(v, offsets, columns)
+            t = cudss.factorize(t, v)
+            return cudss.solve(t, bb)
+        return jnp.sum(jnp.sin(jax.vmap(jax.vmap(one))(vals, b)))
+
+    iu = np.triu_indices(n)  # _sym_system stores the full upper triangle
+
+    def dense_loss(vals, b):
+        def one(v, bb):
+            U = jnp.zeros((n, n), v.dtype).at[iu].set(v)
+            return jnp.linalg.solve(U + U.T - jnp.diag(jnp.diag(U)), bb)
+        return jnp.sum(jnp.sin(jax.vmap(jax.vmap(one))(vals, b)))
+
+    g_vals, g_b = jax.grad(loss, argnums=(0, 1))(vals, b)
+    g_vals_d, g_b_d = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
+    np.testing.assert_allclose(np.asarray(g_vals), np.asarray(g_vals_d),
+                               atol=1e-9)
+    np.testing.assert_allclose(np.asarray(g_b), np.asarray(g_b_d), atol=1e-9)
+
+
 # error handling ===============================================================
 def test_solve_before_factorize_raises():
     _require_gpu()
@@ -500,25 +596,28 @@ def test_legacy_composability():
     assert jnp.allclose(x2, jnp.stack([true_x1, true_x2]), rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.xfail(
-    reason="nested vmap of token ops is not supported: the custom_vmap rules "
-    "emit plain ffi_calls which have no batching rule for an outer vmap. "
-    "Flatten nested batches into one block-diagonal batch instead.",
-    strict=True,
-)
 def test_legacy_nested_vmap():
+    # nested vmap composes: every custom_vmap rule collapses one axis and
+    # recurses, so a (2, 2) batch is the same ONE block-diagonal system as
+    # the flattened (4,) batch
     _require_gpu()
     M1, b1, _, _ = _legacy_base_system(jnp.float32)
     offsets, columns, values1 = _csr_of(M1)
-    values = jnp.stack([jnp.stack([values1, values1])] * 2)
-    b = jnp.stack([jnp.stack([b1, b1])] * 2)
+    scales = jnp.array([[1.0, 2.0], [0.5, 4.0]], dtype=jnp.float32)
+    values = scales[..., None] * values1
+    b = jnp.broadcast_to(b1, (2, 2) + b1.shape)
 
     def token_solve(values, b):
         t = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
         t = cudss.factorize(t, values)
         return cudss.solve(t, b)
 
-    jax.jit(jax.vmap(jax.vmap(token_solve)))(values, b)
+    x = jax.jit(jax.vmap(jax.vmap(token_solve)))(values, b)
+    x_flat = jax.jit(jax.vmap(token_solve))(
+        values.reshape(4, -1), jnp.broadcast_to(b1, (4,) + b1.shape))
+    assert x.shape == (2, 2) + b1.shape
+    np.testing.assert_allclose(np.asarray(x).reshape(4, -1),
+                               np.asarray(x_flat), rtol=1e-5)
 
 
 @pytest.mark.parametrize(

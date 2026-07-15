@@ -26,7 +26,10 @@ system, and a single system is the B=1 special case, all served by the
 - ``jax.vmap`` over ``analyze`` (batched values, shared or batched pattern):
   ONE block-diagonal registry entry; the token id is broadcast across the
   batch, and vmapped ``factorize``/``refactorize``/``solve`` collapse to one
-  block-diagonal cuDSS call each.
+  block-diagonal cuDSS call each. vmap COMPOSES: every custom_vmap rule
+  collapses one axis and recurses into the wrapped function, so nested vmap
+  (any depth, and mixed with the explicit door or autodiff-added axes) peels
+  level by level into the same one flat block-diagonal system.
 - explicit shapes: ``analyze`` with 2-D ``(B, nnz)`` values mints the same
   kind of entry eagerly, with ``batch_size=B`` recorded in the token statics.
 
@@ -116,8 +119,9 @@ class FactorToken(eqx.Module):
 
     ``id`` is the traced dispatch leaf: dataflow ordering, vjp residuals and
     vmap batching all operate on it. It is ``int32[1]`` for a token minted
-    outside vmap, or ``int32[B, 1]`` (B equal copies of one entry id) for a
-    token minted by ``vmap(analyze)``.
+    outside vmap, or ``int32[B1, ..., Bk, 1]`` (equal copies of one entry id,
+    one leading axis per vmap level) for a token minted under (possibly
+    nested) ``vmap(analyze)``.
 
     ``values``/``offsets``/``columns`` are zero-copy references to the
     caller's CSR arrays (the block pattern exactly as handed to ``analyze``,
@@ -128,7 +132,7 @@ class FactorToken(eqx.Module):
     token self-describing — a FactorToken is directly a lineax solver state.
     """
 
-    id: Array                                # int32[1] or int32[B, 1] — traced
+    id: Array                                # int32[1] (+1 axis per vmap level) — traced
     values: Array                            # (nnz,) or (B, nnz)
     offsets: Array                           # int32 (n+1,) or (B, n+1)
     columns: Array                           # int32 (nnz,) or (B, nnz)
@@ -185,8 +189,8 @@ def _expand_structure(offsets, columns, batch_size):
     n = offsets.shape[-1] - 1
     nnz = columns.shape[-1]
     shift = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
-    offs_2d = offsets if offsets.ndim == 2 else offsets[None, :]
-    cols_2d = columns if columns.ndim == 2 else columns[None, :]
+    offs_2d = offsets.reshape((-1, offsets.shape[-1]))  # any leading axes
+    cols_2d = columns.reshape((-1, columns.shape[-1]))
     body = (offs_2d[:, 1:] + shift * jnp.int32(nnz)).reshape(-1)
     offsets_bd = jnp.concatenate([jnp.zeros((1,), jnp.int32), body])
     columns_bd = (cols_2d + shift * jnp.int32(n)).reshape(-1)
@@ -211,10 +215,9 @@ def _ir_off():
 
 
 def _batch_of(token: FactorToken) -> int:
-    """Effective batch size: explicit-door static, or vmap-minted id shape."""
-    if token.id.ndim == 2:
-        return token.id.shape[0]
-    return token.batch_size
+    """Total block count: one id axis per vmap level times the explicit-door
+    static — the two doors compose (e.g. vmap over an explicit batch)."""
+    return int(np.prod(token.id.shape[:-1])) * token.batch_size
 
 
 # raw FFI calls ================================================================
@@ -276,19 +279,21 @@ def _make_analyze(suffix, device_id, mtype_id, mview_id):
 
     @analyze_id.def_vmap
     def _(axis_size, in_batched, csr_values, csr_offsets, csr_columns):
-        # A batch of systems is ONE block-diagonal system: mint one entry and
-        # broadcast its id across the batch. (Unbatched inputs never reach
-        # this rule — JAX hoists them out of vmap.)
+        # A batch of systems is ONE block-diagonal system: collapse THIS
+        # level's axis into the pattern, then RECURSE into the wrapped
+        # function (never the raw FFI) so any outer vmap levels peel off
+        # through this rule again and the mint happens once, at full
+        # flatness. _expand_structure composes associatively — every nesting
+        # that flattens to the same total batch produces a bit-identical
+        # pattern and fingerprint. (Fully-unbatched calls never reach this
+        # rule — JAX hoists them out of vmap.)
         vb, _, _ = in_batched
         vals = csr_values if vb else jnp.broadcast_to(
             csr_values, (axis_size,) + csr_values.shape)
-        offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns,
-                                                 axis_size)
-        token_id = _ffi_analyze(vals, offs_bd, cols_bd, fp,
-                                batch_size=axis_size,
-                                device_id=device_id, mtype_id=mtype_id,
-                                mview_id=mview_id)
-        return jnp.broadcast_to(token_id, (axis_size, 1)), True
+        offs_bd, cols_bd, _ = _expand_structure(csr_offsets, csr_columns,
+                                                axis_size)
+        token_id = analyze_id(vals.reshape(-1), offs_bd, cols_bd)
+        return jnp.broadcast_to(token_id, (axis_size,) + token_id.shape), True
 
     return analyze_id
 
@@ -313,8 +318,12 @@ def _make_numeric(suffix, refactor):
                 "factorizations. vmap(analyze) over the batch first.")
         vals = csr_values if vb else jnp.broadcast_to(
             csr_values, (axis_size,) + csr_values.shape)
-        offs_bd, cols_bd, fp = _expand_structure(offsets, columns, axis_size)
-        return _ffi_numeric(token_id, offs_bd, cols_bd, fp, vals, op=op), True
+        # Collapse one axis and recurse (see the analyze rule): the batched
+        # ids are equal copies of the one block entry, so the first id plus
+        # the expanded pattern describe the whole level.
+        offs_bd, cols_bd, _ = _expand_structure(offsets, columns, axis_size)
+        out_id = numeric_id(token_id[0], offs_bd, cols_bd, vals.reshape(-1))
+        return jnp.broadcast_to(out_id, (axis_size,) + out_id.shape), True
 
     return numeric_id
 
@@ -377,7 +386,8 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
 
     Under ``jax.vmap`` a batched system likewise becomes ONE block-diagonal
     entry (the token id is broadcast across the batch); an unbatched system is
-    hoisted out and analyzed once.
+    hoisted out and analyzed once. Nested vmap composes — each level peels
+    one axis into the same flat block-diagonal construction.
     """
     core = _make_analyze_ad(_suffix(jnp.dtype(csr_values.dtype)),
                             int(device_id), int(mtype_id), int(mview_id))
@@ -394,14 +404,15 @@ def _make_analyze_ad(suffix, device_id, mtype_id, mview_id):
         n = csr_offsets.shape[-1] - 1
         nnz = csr_columns.shape[-1]
         if csr_values.ndim == 2:
-            # explicit block-diagonal batch door
+            # explicit block-diagonal batch door: expand eagerly, then go
+            # through the same custom_vmap wrapper as the flat case so the
+            # door itself stays vmappable (an outer vmap peels through the
+            # wrapper's rule instead of hitting the raw FFI)
             batch_size = int(csr_values.shape[0])
-            offs_bd, cols_bd, fp = _expand_structure(csr_offsets, csr_columns,
-                                                     batch_size)
-            token_id = _ffi_analyze(
-                csr_values, offs_bd, cols_bd, fp,
-                batch_size=batch_size, device_id=device_id,
-                mtype_id=mtype_id, mview_id=mview_id)
+            offs_bd, cols_bd, _ = _expand_structure(csr_offsets, csr_columns,
+                                                    batch_size)
+            token_id = _make_analyze(suffix, device_id, mtype_id, mview_id)(
+                csr_values.reshape(-1), offs_bd, cols_bd)
             return FactorToken(
                 id=token_id, values=csr_values, offsets=csr_offsets,
                 columns=csr_columns,
@@ -448,24 +459,28 @@ def _numeric(token, csr_values, refactor):
             f"spineax tokens: {op} values size {csr_values.shape[-1]} != "
             f"token nnz {token.nnz}")
     B = _batch_of(token)
-    if (B > 1 or token.id.ndim == 2) and (
-            csr_values.ndim != 2 or csr_values.shape[0] != B):
+    if (B > 1 or token.id.ndim >= 2) and (
+            csr_values.ndim < 2 or
+            int(np.prod(csr_values.shape[:-1])) != B):
         raise ValueError(
             f"spineax tokens: {op} on a batch token expects values "
-            f"({B}, {token.nnz}), got {csr_values.shape}")
+            f"({B}, {token.nnz}) (leading axes flattening to {B}), "
+            f"got {csr_values.shape}")
     return _make_numeric_ad(refactor)(token, csr_values)
 
 
 def _numeric_impl(token, csr_values, refactor):
-    op = "refactorize" if refactor else "factorize"
     B = _batch_of(token)
-    if B > 1 or token.id.ndim == 2:
+    if B > 1 or token.id.ndim >= 2:
         # batch entry used eagerly (explicit door, or vmap-minted token used
-        # outside vmap): one block-diagonal numeric phase
-        offs_bd, cols_bd, fp = _expand_structure(token.offsets,
-                                                 token.columns, B)
-        token_id = _ffi_numeric(token.id, offs_bd, cols_bd, fp, csr_values,
-                                op=op)
+        # outside vmap): one block-diagonal numeric phase, through the same
+        # custom_vmap wrapper so transform-added axes stay collapsible
+        offs_bd, cols_bd, _ = _expand_structure(token.offsets,
+                                                token.columns, B)
+        tid = token.id.reshape(-1)[:1]
+        out_id = _make_numeric(_suffix(token.dtype), refactor)(
+            tid, offs_bd, cols_bd, csr_values.reshape(-1))
+        token_id = jnp.broadcast_to(out_id, token.id.shape)
     else:
         token_id = _make_numeric(_suffix(token.dtype), refactor)(
             token.id, token.offsets, token.columns, csr_values)
@@ -531,7 +546,7 @@ def solve(token: FactorToken, b, ir_nsteps=None):
         raise ValueError(
             f"spineax tokens: rhs trailing dim {b.shape[-1]} != token n {token.n}")
     B = _batch_of(token)
-    if (B > 1 or token.id.ndim == 2) and (b.ndim < 2 or b.shape[-2] != B):
+    if (B > 1 or token.id.ndim >= 2) and (b.ndim < 2 or b.shape[-2] != B):
         raise ValueError(
             f"spineax tokens: solve on a batch token expects rhs "
             f"(..., {B}, {token.n}), got {b.shape}")
@@ -566,13 +581,13 @@ def solve(token: FactorToken, b, ir_nsteps=None):
 def _solve_impl(token, b):
     B = _batch_of(token)
     fn = _make_solve(_suffix(token.dtype))
-    if B > 1 or token.id.ndim == 2:
+    if B > 1 or token.id.ndim >= 2:
         # batch entry used eagerly: solve the ONE expanded block-diagonal
         # system single-style, through the same custom_vmap wrapper so any
         # transform-added batch axes stay collapsible (multi-RHS)
         offs_bd, cols_bd, _ = _expand_structure(token.offsets,
                                                 token.columns, B)
-        tid = token.id[0] if token.id.ndim == 2 else token.id
+        tid = token.id.reshape(-1)[:1]
         bf = b.reshape(b.shape[:-2] + (-1,))
         out = fn(tid, offs_bd, cols_bd, token.values.reshape(-1), bf)
         return out.reshape(b.shape)
@@ -729,7 +744,8 @@ def query(token: FactorToken) -> dict:
     B = _batch_of(token)
     tree = int(_ps.nd_partition_tree_size())
     fn = _make_query(_suffix(token.dtype), token.dtype, B * token.n, tree)
-    return dict(zip(_QUERY_FIELDS, fn(token.id)))
+    tid = token.id.reshape(-1)[:1] if token.id.ndim >= 2 else token.id
+    return dict(zip(_QUERY_FIELDS, fn(tid)))
 
 
 def inertia(data: dict, batch_size: int = 1):

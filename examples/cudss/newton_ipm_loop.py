@@ -1,13 +1,11 @@
 """
-Flagship example: the canonical token pattern for a Newton/IPM-style loop.
+Example: the canonical token pattern for a Newton/IPM-style loop.
 
 Everything the token API was designed for, in one loop over a BATCH of
 symmetric indefinite (KKT) systems held as ONE block-diagonal factorization:
 
   - analyze ONCE at setup (structure never changes);
   - each iteration: refactorize-or-not as ordinary lax.cond over the token
-    (a token is a value, so both branches return the same pytree — no
-    signals, no device flags);
   - per-block inertia from the one data door (query -> inertia) to drive
     regularization, checked BEFORE paying for a solve;
   - one block SOLVE for the whole batch.
