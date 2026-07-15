@@ -116,6 +116,37 @@ def test_jit_full_chain():
     np.testing.assert_array_equal(np.asarray(inertia), [A.shape[0], 0])
 
 
+def test_explicit_typed_ffi_api_version():
+    """Every emitted spineax custom call states api_version=4 EXPLICITLY.
+
+    Regression test for the jaxipm-scale compile failure: jax.ffi.ffi_call
+    lowers typed-FFI calls as api_version=1 + an mhlo.backend_config
+    side-attribute and trusts XLA's StableHLO->HLO import to restore the
+    typed version — which does not happen on sufficiently large modules,
+    making every call dispatch as a LEGACY custom call (NOT_FOUND at
+    compile). spineax emits the op itself with the typed form stated in
+    full; nothing is left to restore and the handler ABI (typed FFI, api 4)
+    is pinned even if jax's default version moves.
+    """
+    _require_gpu()
+    values, offsets, columns, A = _sym_system()
+    b = jnp.asarray(np.random.default_rng(6).standard_normal(A.shape[0]))
+
+    def full(values, b):
+        t = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, values)
+        return cudss.solve(t, b, ir_nsteps=1), cudss.inertia(cudss.query(t))
+
+    txt = jax.jit(full).lower(values, b).as_text()
+    calls = [l for l in txt.splitlines() if "spineax_token" in l]
+    assert len(calls) >= 4  # analyze, factorize, query, solve(s)
+    assert all("api_version = 4" in l for l in calls)
+    assert "mhlo.backend_config" not in txt
+    # analyze's static config rides the backend_config DICT attribute
+    (al,) = [l for l in calls if "analyze" in l]
+    assert "mtype_id = 1" in al and "batch_size = 1" in al
+
+
 def test_refactorize():
     _require_gpu()
     values, offsets, columns, A = _sym_system()
