@@ -14,21 +14,13 @@ I expose ***most*** features of cuDSS (as of 0.8.0) to JAX with ***zero-copy arr
 
 This currently supports:
 - ***zero-copies between JAX and cuDSS***
-- ***full FFI jit/vmap integration*** ([example](examples/cudss/))
-- ***all*** cuDSS ***datatypes*** (F32, F64, C64, C128) ([example](examples/cudss/))
-- ✅ ***all*** cuDSS ***solvers*** (general, symmetric, symmetric positive defnite, hermitian, hermitian positive definite) ([example](examples/cudss/))
-- ✅ ***all*** cuDSS ***outputs*** ([example](examples/cudss/outputs.py), even in the batched case!)
-- ✅ ***Differentiation*** through cuDSS solvers (and even re-use of factorizations when doing so!) ([example](examples/cudss/))
-- ✅ Batches of ***heterogeneous sparsity patterns***, and even ***heterogeneous sizes***! ([example](examples/cudss/))
+- ***full FFI jit/vmap/grad integration*** ([example](examples/cudss/composability.py))
+- ***all*** cuDSS ***datatypes*** (F32, F64, C64, C128) ([example](examples/cudss/datatypes.py))
+- ***all*** cuDSS ***solvers*** (general, symmetric, symmetric positive defnite, hermitian, hermitian positive definite) ([example](examples/cudss/solver_types.py))
+- ***all*** cuDSS ***outputs*** ([example](examples/cudss/outputs.py), even in the batched case!)
+- Batches of ***heterogeneous sparsity patterns***, and even ***heterogeneous sizes***! ([example](examples/cudss/heterogeneous_batch.py))
 
-We have also added a ***new Lineax-based API***, which is now the recommended method of interfacing with spineax.
-
-### Examples
-
-* [JAX transformation composability](examples/cudss/composability.py)
-* [Testing all available datatypes](examples/cudss/datatypes.py)
-* [Seeing all cuDSS auxilliary outputs](examples/cudss/outputs.py)
-* [Testing all available solvers (general, sym, herm, spd, hpd)](examples/cudss/solver_types.py)
+We have also added a ***new Lineax-based API***, which is now the recommended method of interfacing with spineax ([example](examples/cudss/lineax_solver.py)).
 
 # Installation
 
