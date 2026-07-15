@@ -1,0 +1,59 @@
+name: Build & publish cu13 wheel
+
+# Builds the single cp312-abi3 / manylinux_2_28 / x86_64 CUDA-13 wheel with
+# cibuildwheel (all knobs live in [tool.cibuildwheel] in pyproject.toml).
+#
+#   - PRs / manual runs: build the wheel as a CI check and upload it as an artifact.
+#   - Pushing a v* tag:  build, then publish to PyPI via Trusted Publishing (OIDC).
+#
+# Trusted Publishing setup (one-time, no API token needed): on PyPI add a
+# publisher for this repo with workflow `wheels.yml` and environment `pypi`
+# (https://docs.pypi.org/trusted-publishers/). No GPU is needed to build.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "spineax/**"
+      - ".github/workflows/wheels.yml"
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build_wheels:
+    name: Build cu13 abi3 wheel (manylinux_2_28, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bump the pin as new cibuildwheel releases land.
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v2.21.3
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cibw-wheels
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    # Only publish on a version tag push.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for PyPI Trusted Publishing
+    steps:
+      - name: Download built wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: cibw-wheels
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

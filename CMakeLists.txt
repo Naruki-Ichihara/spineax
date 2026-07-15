@@ -1,11 +1,16 @@
-cmake_minimum_required(VERSION 3.15...3.27)
+# 3.26 is the floor for find_package(Python COMPONENTS Development.SABIModule),
+# which nanobind's STABLE_ABI (abi3 wheel) build requires.
+cmake_minimum_required(VERSION 3.26...3.27)
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 # Force all CUDA libraries to be linked dynamically.
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 # 1. Find the Python interpreter from your active environment.
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+# Development.SABIModule is required so nanobind's STABLE_ABI actually engages and
+# emits a limited-API pbatch_solve.abi3.so; without it STABLE_ABI is silently
+# ignored and the module is built version-specific (e.g. .cpython-313.so).
+find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
 message(STATUS "Using Python interpreter: ${Python_EXECUTABLE}")
 
 # 2. Use NVIDIA libs from Python site-packages/nvidia/*/ (directories there contain include/ and lib/).
@@ -155,53 +160,23 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
-# Build device code for the GPU(s) present on the build machine by default.
-# Must be set BEFORE enable_language(CUDA): that call otherwise caches nvcc's
-# default arch (sm_75) and ships only PTX for newer GPUs (e.g. Blackwell sm_120).
-# The driver then has to JIT that PTX at kernel launch, and if the toolkit's PTX
-# ISA is newer than the installed driver supports it fails at runtime with
-# cudaErrorUnsupportedPtxVersion. Emitting a native cubin for the real arch
-# avoids the JIT entirely.
-# Override with -DCMAKE_CUDA_ARCHITECTURES=120 (or a list) when cross-building.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
-
-enable_language(CUDA)
-message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
-
-# Option to disable pbatch_solve (useful when nvcc version doesn't match CUDA runtime)
-option(BUILD_PBATCH_SOLVE "Build pseudo batch solve module (requires matching nvcc)" ON)
-
 # cuDSS FFI files
 
-# traditional batch
-nanobind_add_module(batch_solve NOMINSIZE
-  src/spineax/cudss/batch_solve.cpp
-)
-
-# pseudo batch (enable features lacking in normal batch whilst also solving a batch)
-if(BUILD_PBATCH_SOLVE)
-  nanobind_add_module(pbatch_solve NOMINSIZE
-    src/spineax/cudss/pseudo_batch_solve.cu
-  )
-endif()
-
-# single solve and Return Everything (return all data that cuDSS has)
-nanobind_add_module(single_solve_re NOMINSIZE
-  src/spineax/cudss/single_solve_re.cpp
-)
-
-# traditional single solve
-nanobind_add_module(single_solve NOMINSIZE
-  src/spineax/cudss/single_solve.cpp
+# The token API (docs/token_design.md): every solve is the batch_size>=1 case
+# of the block-diagonal construction, so this one module is the whole backend.
+# Plain C++ since the zero-copy redesign (design doc step 10): no device code,
+# only CUDA runtime API calls — nvcc is NOT required to build spineax.
+#
+# STABLE_ABI: compile against CPython's limited API (Py_LIMITED_API) so a single
+# abi3 wheel works on every CPython >= 3.12. nanobind requires >= 3.12 for stable
+# ABI, which is why pyproject sets requires-python = ">=3.12". Paired with
+# [tool.scikit-build.wheel] py-api = "cp312" so the wheel is tagged cp312-abi3.
+nanobind_add_module(pbatch_solve STABLE_ABI NOMINSIZE
+  spineax/cudss/solver.cpp
 )
 
 # Build list of targets
-set(SPINEAX_TARGETS batch_solve single_solve single_solve_re)
-if(BUILD_PBATCH_SOLVE)
-  list(APPEND SPINEAX_TARGETS pbatch_solve)
-endif()
+set(SPINEAX_TARGETS pbatch_solve)
 
 foreach(TARGET ${SPINEAX_TARGETS})
   target_include_directories(${TARGET} PRIVATE

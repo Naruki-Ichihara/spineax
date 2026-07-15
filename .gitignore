@@ -1,4 +1,8 @@
+.benchmarks/
+.claude/
+
 tmp
+docs/
 
 # build files
 build
