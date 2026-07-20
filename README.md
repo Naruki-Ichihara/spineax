@@ -43,15 +43,6 @@ uv pip install spineax
 > Using a uv-managed project instead? Just `uv add spineax`.
 
 
-<!-- ## Troubleshooting
-
-### Build fails with `__cudaGetKernel was not declared`
-
-This happens when your system's CUDA toolkit version doesn't match the pip-installed CUDA runtime.
-The `pbatch_solve` native module is the whole cuDSS backend and cannot be skipped, so the fix is to
-build with a CUDA toolkit that matches the runtime major version of your `jax[cuda12]`/`jax[cuda13]`
-install (e.g. via an `nvidia/cuda` container of the right version). -->
-
 # Citation
 
 ```

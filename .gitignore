@@ -1,6 +1,7 @@
 .benchmarks/
 .claude/
 
+scripts/
 tmp
 docs/
 

@@ -20,7 +20,7 @@ On a backward-stable factorization the residual already sits at the
 same-precision floor and extra steps do nothing. The system below is the
 interesting case — a symmetric-indefinite KKT matrix whose badly scaled H
 block makes the static-pivoted LDL^T factors inaccurate, so one refinement
-step buys ~10 digits in both residual and solution.
+step buys ~10 orders of magnitude in both residual and solution.
 """
 
 import numpy as np

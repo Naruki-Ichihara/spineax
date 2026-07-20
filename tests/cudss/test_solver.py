@@ -520,6 +520,33 @@ def test_grad_under_nested_vmap():
     np.testing.assert_allclose(np.asarray(g_b), np.asarray(g_b_d), atol=1e-9)
 
 
+def test_grad_through_checkpoint():
+    """Reverse mode through jax.checkpoint/remat (issue #18): the phase chain
+    must stay effect-free at the jaxpr level — remat partial-eval rejects any
+    effectful equation — while XLA-level ordering rides on has_side_effect
+    and the token id dataflow."""
+    _require_gpu()
+    values, offsets, columns, _ = _sym_system(n=20)
+    b = jnp.asarray(np.random.default_rng(29).standard_normal(20))
+
+    def chain(v):
+        t = cudss.analyze(v, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.factorize(t, v)
+        return cudss.solve(t, b)
+
+    loss = lambda v: jnp.sum(chain(v) ** 2)
+    loss_remat = lambda v: jnp.sum(jax.checkpoint(chain)(v) ** 2)
+
+    assert np.isfinite(float(loss_remat(values)))  # forward through remat
+    g = jax.grad(loss_remat)(values)               # used to raise on FfiEffect
+    g_ref = jax.grad(loss)(values)
+    np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref), atol=1e-12)
+    # and jitted, where partial-eval actually splits the jaxpr
+    g_jit = jax.jit(jax.grad(loss_remat))(values)
+    np.testing.assert_allclose(np.asarray(g_jit), np.asarray(g_ref),
+                               atol=1e-12)
+
+
 # error handling ===============================================================
 def test_solve_before_factorize_raises():
     _require_gpu()

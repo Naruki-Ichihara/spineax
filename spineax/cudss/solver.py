@@ -281,10 +281,11 @@ _ffi_p.def_impl(lambda *args, name, out_avals, attrs:
                 _ffi_eager(name, out_avals, attrs)(*args))
 
 
-@_ffi_p.def_effectful_abstract_eval
+# issue #18 fixed by Igor Kuszczak - no need for effectful things after token rework.
+@_ffi_p.def_abstract_eval
 def _ffi_abstract_eval(*avals_in, name, out_avals, attrs):
     del avals_in, name, attrs
-    return list(out_avals), {_SPINEAX_FFI_EFFECT}
+    return list(out_avals)
 
 
 def _ir_tensor_type(aval):
