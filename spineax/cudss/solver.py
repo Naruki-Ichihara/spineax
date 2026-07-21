@@ -393,14 +393,44 @@ def _make_solve(suffix, cfg):
 
 
 # free functions ===============================================================
+# name -> cuDSS enum value (header order); every knob also takes the raw int
+_MTYPE_IDS = {"general": 0, "symmetric": 1, "hermitian": 2,
+              "spd": 3, "symmetric_positive_definite": 3,
+              "hpd": 4, "hermitian_positive_definite": 4}
+_MVIEW_IDS = {"full": 0, "upper": 1, "lower": 2}
+_REORDERING_IDS = {"default": 0, "btf_colamd": 1, "colamd": 2, "amd": 3,
+                   "nested_dissection": 4, "none": 5}
+_MEMORY_IDS = {"device": 0, "hybrid": 1}
+
+
+def _knob_id(table, value, what):
+    if not isinstance(value, str):
+        return int(value)  # raw cuDSS enum value
+    try:
+        return table[value]
+    except KeyError:
+        raise ValueError(
+            f"spineax tokens: unknown {what} {value!r} "
+            f"(one of: {', '.join(table)})") from None
+
+
 def analyze(csr_values, csr_offsets, csr_columns, *,
-            mtype_id=1, mview_id=1, device_id=0,
-            reordering_id=0, memory_id=0) -> FactorToken:
-    """``reordering_id``: cudssReorderingAlg_t — 0 default, 1 btf_colamd,
-    2 colamd, 3 amd, 4 nested_dissection, 5 none (natural order).
-    ``memory_id``: 0 device (default), 1 hybrid host+device factors."""
-    cfg = (int(device_id), int(mtype_id), int(mview_id),
-           int(reordering_id), int(memory_id))
+            mtype_id: str | int = "symmetric",
+            mview_id: str | int = "upper",
+            device_id=0,
+            reordering: str | int = "default",
+            memory: str | int = "device") -> FactorToken:
+    """``mtype_id``: "general", "symmetric", "hermitian", "spd" or "hpd".
+    ``mview_id``: "full", "upper" or "lower".
+    ``reordering``: "default", "btf_colamd", "colamd", "amd",
+    "nested_dissection" or "none" (natural order).
+    ``memory``: "device" (default) or "hybrid" host+device factors.
+    Every knob also accepts the raw cuDSS enum int."""
+    cfg = (int(device_id),
+           _knob_id(_MTYPE_IDS, mtype_id, "mtype"),
+           _knob_id(_MVIEW_IDS, mview_id, "mview"),
+           _knob_id(_REORDERING_IDS, reordering, "reordering"),
+           _knob_id(_MEMORY_IDS, memory, "memory"))
     core = _make_analyze_ad(_suffix(jnp.dtype(csr_values.dtype)), cfg)
     return core(csr_values, csr_offsets.astype(jnp.int32),
                 csr_columns.astype(jnp.int32))
@@ -678,8 +708,8 @@ def _transpose_solve_general(token, rhs, nsteps):
                                             offs_bd, cols_bd)
     t_token = analyze(t_vals, t_offs, t_cols,
                       mtype_id=0, mview_id=0, device_id=token.device_id,
-                      reordering_id=token.reordering_id,
-                      memory_id=token.memory_id)
+                      reordering=token.reordering_id,
+                      memory=token.memory_id)
     t_token = factorize(t_token, t_token.values)
     rf = rhs.reshape(rhs.shape[:-2] + (-1,)) if B > 1 else rhs
     return _refined_solve(t_token, rf, nsteps).reshape(rhs.shape)
@@ -938,8 +968,8 @@ class CuDSS(lx.AbstractLinearSolver):
     """
 
     # cuDSS knobs (see ``analyze``): reordering algorithm and factor storage
-    reordering_id: int = 0
-    memory_id: int = 0
+    reordering: str = "default"
+    memory: str = "device"
 
     # explicit phases ----------------------------------------------------------
 
@@ -950,8 +980,7 @@ class CuDSS(lx.AbstractLinearSolver):
             mtype_id = 0
         return analyze(operator.values, operator.offsets, operator.columns,
                        mtype_id=mtype_id, mview_id=0,
-                       reordering_id=self.reordering_id,
-                       memory_id=self.memory_id)
+                       reordering=self.reordering, memory=self.memory)
 
     def factorize(self, token, operator):
         return factorize(token, operator.values)
@@ -987,8 +1016,8 @@ class CuDSS(lx.AbstractLinearSolver):
                                                 state.columns)
         t_token = analyze(t_vals, t_offs, t_cols,
                           mtype_id=0, mview_id=0, device_id=state.device_id,
-                          reordering_id=state.reordering_id,
-                          memory_id=state.memory_id)
+                          reordering=state.reordering_id,
+                          memory=state.memory_id)
         return factorize(t_token, t_token.values), options
 
     def conj(self, state, options):

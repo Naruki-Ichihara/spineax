@@ -1075,32 +1075,35 @@ def test_lru_eviction_self_heals():
 
 
 def test_cudss_config_knobs():
-    """reordering_id/memory_id reach cuDSS, and survive eviction self-heal
+    """reordering/memory knobs reach cuDSS, and survive eviction self-heal
     (they are part of the token's rebuild recipe like mtype/mview)."""
     _require_gpu()
     values, offsets, columns, A = _sym_system(n=80)
     b = jnp.asarray(np.random.default_rng(19).standard_normal(A.shape[0]))
 
     lu = {}
-    for rid in (0, 5):  # default (fill-reducing) vs natural order
+    for alg in ("default", "none"):  # fill-reducing vs natural order
         t = cudss.factorize(
-            cudss.analyze(values, offsets, columns, reordering_id=rid), values)
+            cudss.analyze(values, offsets, columns, reordering=alg), values)
         assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
-        lu[rid] = int(np.asarray(cudss.query(t)["lu_nnz"])[0])
-    assert lu[5] >= lu[0]
+        lu[alg] = int(np.asarray(cudss.query(t)["lu_nnz"])[0])
+    assert lu["none"] >= lu["default"]
 
     # hybrid host+device factors, evicted and healed with the same config
     t = cudss.factorize(
-        cudss.analyze(values, offsets, columns, reordering_id=5, memory_id=1),
-        values)
+        cudss.analyze(values, offsets, columns, reordering="none",
+                      memory="hybrid"), values)
     for _ in range(cudss.cache_capacity()):
         cudss.analyze(values, offsets, columns).id.block_until_ready()
     assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
-    assert int(np.asarray(cudss.query(t)["lu_nnz"])[0]) == lu[5]
+    assert int(np.asarray(cudss.query(t)["lu_nnz"])[0]) == lu["none"]
 
+    with pytest.raises(ValueError, match="unknown reordering"):
+        cudss.analyze(values, offsets, columns, reordering="bogus")
     with pytest.raises(Exception, match="invalid reordering_id"):
+        # raw enum ints pass through; out-of-range is the C++ backstop
         cudss.analyze(values, offsets, columns,
-                      reordering_id=9).id.block_until_ready()
+                      reordering=9).id.block_until_ready()
 
 
 def test_numeric_phases_rename():
