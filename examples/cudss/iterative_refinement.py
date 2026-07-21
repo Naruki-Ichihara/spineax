@@ -4,8 +4,10 @@ Example: JAX-native iterative refinement via solve(token, b, ir_nsteps=...).
 cuDSS's internal IR is permanently OFF in spineax: its refinement SpMV reads
 CSR pointers captured at earlier phase calls, which under the zero-copy
 design are dead XLA temporaries by solve time for batched systems (see
-_ir_off in solver.py). Instead, ir_nsteps is a STATIC argument on solve()
-that unrolls same-precision Richardson refinement into the jaxpr:
+_refined_solve in solver.py). Instead, ir_nsteps on solve() runs
+same-precision Richardson refinement JAX-side — a Python int unrolls it
+into the jaxpr, a TRACED int32 runs it as a fori_loop, so the step count
+can vary at runtime (even data-dependently) under one compilation:
 
     x = A^-1 b;   then ir_nsteps times:   x += A^-1 (b - A x)
 
@@ -20,7 +22,7 @@ On a backward-stable factorization the residual already sits at the
 same-precision floor and extra steps do nothing. The system below is the
 interesting case — a symmetric-indefinite KKT matrix whose badly scaled H
 block makes the static-pivoted LDL^T factors inaccurate, so one refinement
-step buys ~10 digits in both residual and solution.
+step buys ~10 orders of magnitude in both residual and solution.
 """
 
 import numpy as np
@@ -129,13 +131,56 @@ def test_static_unrolled_in_jit():
     print()
 
 
+def test_traced_ir_nsteps_in_jit():
+    """ir_nsteps may be TRACED: one compilation serves every step count, and
+    the count can even be chosen on-device from a measured residual — the
+    adaptive pattern an IPM uses (refine only when the factors are shaky)."""
+    print("=" * 74)
+    print("TEST 3: traced ir_nsteps — runtime-varying under ONE compilation")
+    print("=" * 74)
+
+    K = make_kkt()
+    b = jnp.asarray(K @ rng.standard_normal(K.shape[0]))
+    vals, offs, cols = upper_csr(K)
+    Kj = jnp.asarray(K)
+
+    token = cudss.analyze(vals, offs, cols, mtype_id=1, mview_id=1)
+    token = cudss.factorize(token, vals)
+
+    @jax.jit
+    def solve_k(token, b, k):
+        return cudss.solve(token, b, ir_nsteps=k)
+
+    def res(x):
+        return float(jnp.linalg.norm(Kj @ x - b) / jnp.linalg.norm(b))
+
+    for k in (0, 1, 3):
+        print(f"  ir_nsteps={k}  |  relative residual = "
+              f"{res(solve_k(token, b, jnp.int32(k))):.2e}")
+    assert solve_k._cache_size() == 1, "traced k must not retrace"
+    print(f"  jit cache size: {solve_k._cache_size()} (one trace for all k)")
+
+    @jax.jit
+    def adaptive_solve(token, b, tol):
+        x = cudss.solve(token, b)
+        r = jnp.linalg.norm(Kj @ x - b) / jnp.linalg.norm(b)
+        k = jnp.where(r > tol, 2, 0)  # decided on-device, no host round-trip
+        return cudss.solve(token, b, ir_nsteps=k)
+
+    x = adaptive_solve(token, b, 1e-12)
+    print(f"  adaptive (residual-triggered) solve residual = {res(x):.2e}")
+    assert res(x) < 1e-12
+    print("  PASS: data-dependent refinement depth inside jit")
+    print()
+
+
 def test_ir_composes_with_grad():
     """Refined solves differentiate like unrefined ones: the refinement sits
     inside the non-differentiated solver callables, gradients come from the
     implicit function theorem, and the adjoint solves are themselves REFINED
     — so on this system the ir=2 gradient is the trustworthy one."""
     print("=" * 74)
-    print("TEST 3: grad through a refined solve")
+    print("TEST 4: grad through a refined solve")
     print("=" * 74)
 
     K = make_kkt()
@@ -158,5 +203,6 @@ def test_ir_composes_with_grad():
 if __name__ == "__main__":
     test_refinement_recovers_digits()
     test_static_unrolled_in_jit()
+    test_traced_ir_nsteps_in_jit()
     test_ir_composes_with_grad()
     print("All iterative refinement examples completed.")
