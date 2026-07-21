@@ -1038,7 +1038,15 @@ class CuDSS(lx.AbstractLinearSolver):
         return factorize(t_token, t_token.values), options
 
     def conj(self, state, options):
-        return state, options  # real-valued operators
+        if not jnp.issubdtype(state.dtype, jnp.complexfloating):
+            return state, options
+        values = jnp.conj(state.values)
+        token = analyze(values, state.offsets, state.columns,
+                        mtype_id=state.mtype_id, mview_id=state.mview_id,
+                        device_id=state.device_id,
+                        reordering=state.reordering_id,
+                        memory=state.memory_id)
+        return factorize(token, values), options
 
     def assume_full_rank(self):
         return True
