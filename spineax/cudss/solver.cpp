@@ -1,36 +1,14 @@
-/*
-spineax's cuDSS backend: token-based persistent factorization
-(docs/token_design.md).
-
-Batch systems are solved WITHOUT cuDSS's batch API: a batch of B systems is
-its block-diagonal concatenation, one bigger sparse system. This exposes data
-(per-block inertia via diag/perm) the batch API does not, and makes a single
-solve just the batch_size=1 special case — so this one module is the whole
-backend.
-
-ZERO-COPY (design doc step 10): the registry entry owns nothing but the cuDSS
-objects (handles + factors). The CSR structure and values live in the Python
-FactorToken pytree and arrive as live XLA buffers on EVERY phase call, already
-expanded to the block-diagonal layout by the Python wrappers;
-cudssMatrixSetCsrPointers repoints the descriptor before each execute. cuDSS
-therefore never reads a buffer that outlived its FFI call — the same per-call
-repointing discipline the legacy signal system used.
-*/
-
 #include <cstdint>
 #include <memory>
 #include <vector>
 #include <complex>
 #include <type_traits>
-// #include <cuComplex.h> // For device-side complex number operations
-
 #include "cuda_runtime_api.h"
 #include "nanobind/nanobind.h"
 #include "xla/ffi/api/ffi.h"
 #include "cudss.h"
 #include <mutex>
 #include <map>
-#include <unordered_map>
 #include <atomic>
 #include <cstdlib>
 #include <list>
@@ -53,36 +31,6 @@ template<> struct get_native_data_type<ffi::F64> { using type = double; };
 template<> struct get_native_data_type<ffi::C64> { using type = std::complex<float>; };
 template<> struct get_native_data_type<ffi::C128> { using type = std::complex<double>; };
 
-// =============================================================================
-// Token-based persistent factorization (docs/token_design.md)
-//
-// This is THE token implementation: a single solve is just the batch_size=1
-// special case of the block-diagonal construction, so all four tiers live
-// here, over one process-global LRU registry:
-//
-//   analyze(values, offsets_bd, columns_bd)          -> token   block ANALYSIS
-//   factorize(tokens, offs_bd, cols_bd, values, ir)  -> tokens  block FACTORIZATION
-//   refactorize(tokens, offs_bd, cols_bd, values, ir)-> tokens  block REFACTORIZATION
-//   solve(tokens, offs_bd, cols_bd, values, b, ir)   -> x       block SOLVE
-//   query(tokens)                                    -> every cuDSS data item
-//
-// (offs_bd/cols_bd = the block-diagonal structure, expanded by the Python
-// wrappers with jnp ops; values/b are this call's live buffers. See the
-// zero-copy note at the top of the file.)
-//
-// Phase handlers are pure phase execution; query is the ONE door to
-// post-factorization data (diag, permutations, inertia inputs, ...), returned
-// unconditionally with Python figuring out what it wants — this subsumes
-// single_solve_re.cpp. solve derives nrhs from element_count / (batch·n),
-// which makes multi-RHS on a single entry and a block solve on a batch entry
-// the same code path.
-//
-// The token buffer may carry ONE id (explicit door) or B equal copies (minted
-// by the vmap(analyze) rule, broadcast across the batch axis) — the handlers
-// validate equality, which is also where "stacked distinct tokens" fails
-// loudly.
-// =============================================================================
-
 #define CUDSS_TOKEN_CHECK(call, msg) \
     do { \
         cudssStatus_t s_ = (call); \
@@ -103,18 +51,6 @@ template<> struct get_native_data_type<ffi::C128> { using type = std::complex<do
     }                                                           \
   } while (0)
 
-// One block-diagonal factorization living in the registry. Not templated:
-// dtype is runtime metadata so all dtypes share one registry and id space.
-// ZERO-COPY: the entry owns no CSR data — the descriptor A is repointed at
-// each call's live buffers via cudssMatrixSetCsrPointers, so the only device
-// memory here is the factors inside the cudssData_t.
-//
-// Stream safety: phase calls arrive on whatever stream XLA is running, and
-// XLA owns those streams — it may destroy them between our calls, so the
-// entry must never retain a stream handle. Instead it owns `done`, an event
-// recorded at the end of every phase; the next phase (possibly on a
-// different stream) does cudaStreamWaitEvent on it. That orders the device
-// work across streams with no host sync and no dangling handles.
 struct BatchFactorEntry {
     cudssHandle_t handle = nullptr;
     cudssConfig_t config = nullptr;
@@ -122,24 +58,18 @@ struct BatchFactorEntry {
     cudssMatrix_t A = nullptr;
     cudssMatrix_t x_dummy = nullptr;
     cudssMatrix_t b_dummy = nullptr;
-    cudaEvent_t done = nullptr;    // completion of this entry's last phase
-    uint32_t fp[2] = {0, 0};       // structure fingerprint from analysis:
-                                   // the token's pattern is immutable, and
-                                   // every phase verifies content (not just
-                                   // sizes) against this before repointing
+    cudaEvent_t done = nullptr;    // completion of this entry's last phase - keeps streams alive
+    uint32_t fp[2] = {0, 0};       // structure fingerprint from analysis
     int64_t block_n = 0, block_nnz = 0, batch = 0;  // system N = batch*block_n
     size_t elem_size = 0;
     cudssDataType_t dtype = CUDSS_R_64F;
     cudssMatrixType_t mtype = CUDSS_MTYPE_SYMMETRIC;
     cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
     int64_t device_id = 0;
-    enum Phase { kAnalyzed = 0, kFactorized = 1 };
-    Phase phase = kAnalyzed;
-    int32_t ir_nsteps = 0;
 
     ~BatchFactorEntry() {
         if (done) {
-            cudaEventSynchronize(done);  // an in-flight phase must finish
+            cudaEventSynchronize(done);  // an in-progress phase must finish
             cudaEventDestroy(done);      // before the factors are freed below
         }
         if (A) cudssMatrixDestroy(A);
@@ -151,15 +81,17 @@ struct BatchFactorEntry {
     }
 };
 
-// The process-global registry. Each method backs exactly one consumer:
-// insert (analyze handler, with LRU eviction), release / size / capacity
-// (the token_release / token_registry_size / token_cache_capacity nanobind
-// exports and error messages). Lookup lives in token_begin_phase below.
+// An id names ONE immutable numeric state, forever: analyze mints an id,
+// every numeric phase renames its entry to a fresh id (rekey), and a call
+// arriving with an id that is no longer resident — renamed away or LRU-
+// evicted, the same thing from here — rebuilds the state it describes from
+// its own operands (every phase call carries the full CSR data, zero-copy).
 struct BatchTokenRegistry {
     std::mutex mu;
     std::map<int32_t, std::shared_ptr<BatchFactorEntry>> entries;
     std::list<int32_t> lru;  // front = most recently used
     std::atomic<int32_t> next_id{1};
+    std::atomic<int64_t> rebuilds{0};
 
     static BatchTokenRegistry& instance() {
         static BatchTokenRegistry r;
@@ -170,15 +102,34 @@ struct BatchTokenRegistry {
         if (e) { try { return std::stoul(e); } catch (...) {} }
         return 8;
     }
-    int32_t insert(std::shared_ptr<BatchFactorEntry> entry) {
+    // caller holds mu. The counter wraps (int32, ~2^31 mints); 0 and live
+    // ids are skipped, so an id stays unique for as long as any plausible
+    // token citing it survives.
+    int32_t fresh_id_locked() {
+        int32_t id;
+        do { id = next_id.fetch_add(1); } while (id == 0 || entries.count(id));
+        return id;
+    }
+    // Register under `id` (0 = mint fresh), evicting LRU overflow.
+    int32_t insert(std::shared_ptr<BatchFactorEntry> entry, int32_t id = 0) {
         std::lock_guard<std::mutex> lk(mu);
         while (entries.size() >= capacity() && !lru.empty()) {
             int32_t old = lru.back();
             lru.pop_back();
             entries.erase(old);
         }
-        int32_t id = next_id.fetch_add(1);
+        if (id == 0) id = fresh_id_locked();
         entries[id] = std::move(entry);
+        lru.push_front(id);
+        return id;
+    }
+    // Rename a live entry: a numeric phase consumes its input state's name.
+    int32_t rekey(int32_t old_id, const std::shared_ptr<BatchFactorEntry>& e) {
+        std::lock_guard<std::mutex> lk(mu);
+        entries.erase(old_id);
+        lru.remove(old_id);
+        int32_t id = fresh_id_locked();
+        entries[id] = e;
         lru.push_front(id);
         return id;
     }
@@ -193,15 +144,11 @@ struct BatchTokenRegistry {
     }
 };
 
-// Everything a phase call does before touching cuDSS: read the token buffer
-// (1 or B equal ids), find the entry (LRU-touching it), validate dtype and
-// count, select the entry's device, make THIS call's stream wait on the
-// entry's previous phase (event wait — see the stream-safety note on
-// BatchFactorEntry), and bind cuDSS to this stream.
 template <ffi::DataType T>
 static ffi::Error token_begin_phase(cudaStream_t stream,
                                     ffi::Buffer<ffi::S32>& token_buf,
-                                    std::shared_ptr<BatchFactorEntry>* out) {
+                                    std::shared_ptr<BatchFactorEntry>* out,
+                                    int32_t* id_out) {
     int64_t count = token_buf.element_count();
     std::vector<int32_t> ids(count);
     CUDA_TOKEN_CHECK(cudaMemcpyAsync(ids.data(), token_buf.typed_data(),
@@ -218,6 +165,7 @@ static ffi::Error token_begin_phase(cudaStream_t stream,
                 "batch-shaped values) so they share one block-diagonal entry.");
         }
     }
+    *id_out = ids[0];
     std::shared_ptr<BatchFactorEntry> e;
     {
         auto& r = BatchTokenRegistry::instance();
@@ -229,13 +177,10 @@ static ffi::Error token_begin_phase(cudaStream_t stream,
             e = it->second;
         }
     }
-    if (!e) {
-        return ffi::Error::Internal(
-            "spineax token: unknown or evicted factorization token " +
-            std::to_string(ids[0]) + " (cache capacity " +
-            std::to_string(BatchTokenRegistry::capacity()) +
-            "; raise with SPINEAX_FACTOR_CACHE, or call release() less eagerly)");
-    }
+    // Not resident (renamed away or evicted) is not an error: *out stays
+    // null and the caller rebuilds from its own operands, or raises (query,
+    // which carries no CSR data to rebuild from).
+    if (!e) return ffi::Error::Success();
     if (e->dtype != get_cudss_data_type<T>()) {
         return ffi::Error::Internal(
             "spineax pbatch token: dtype mismatch for token " +
@@ -254,13 +199,6 @@ static ffi::Error token_begin_phase(cudaStream_t stream,
     return ffi::Error::Success();
 }
 
-// Validate that a call's expanded structure/values buffers match the entry's
-// block system — sizes AND content: the fingerprint (computed on-device by
-// the Python wrapper over the full expanded structure) must equal the one
-// stored at analysis, because cuDSS's analysis and pivot order are tied to
-// the analyzed pattern and a swapped same-sized pattern would silently
-// produce garbage factors. Then repoint the persistent descriptor at this
-// call's buffers: cuDSS only ever reads buffers of the executing call.
 template <ffi::DataType T>
 static ffi::Error batch_token_repoint(
     BatchFactorEntry* e, cudaStream_t stream,
@@ -305,21 +243,23 @@ static ffi::Error batch_token_repoint(
     return ffi::Error::Success();
 }
 
-// analyze: create the cuDSS objects, run block ANALYSIS ======================
-// The Python wrappers hand over the ALREADY-EXPANDED block-diagonal structure
-// (jnp ops); this handler owns no CSR data.
+// entry construction: cuDSS objects + block ANALYSIS ==========================
+// The Python wrappers hand over the ALREADY-EXPANDED block-diagonal structure.
+// Shared by analyze and by every phase's rebuild-on-miss path.
 template <ffi::DataType T>
-static ffi::Error PbatchTokenAnalyze(
+static ffi::Error create_entry(
     cudaStream_t stream,
-    ffi::Buffer<T> csr_values_buf,          // (B*nnz,) contiguous == block values
-    ffi::Buffer<ffi::S32> offsets_buf,      // (B*n + 1,) expanded
-    ffi::Buffer<ffi::S32> columns_buf,      // (B*nnz,) expanded
-    ffi::Buffer<ffi::U32> fingerprint_buf,  // uint32[2] structure checksum
-    ffi::ResultBuffer<ffi::S32> token_buf,  // int32[1]
+    ffi::Buffer<T>& csr_values_buf,          // (B*nnz,) contiguous == block values
+    ffi::Buffer<ffi::S32>& offsets_buf,      // (B*n + 1,) expanded
+    ffi::Buffer<ffi::S32>& columns_buf,      // (B*nnz,) expanded
+    ffi::Buffer<ffi::U32>& fingerprint_buf,  // uint32[2] structure checksum
     const int64_t batch_size,
     const int64_t device_id,
     const int64_t mtype_id,
-    const int64_t mview_id
+    const int64_t mview_id,
+    const int64_t reordering_id,
+    const int64_t memory_id,
+    std::shared_ptr<BatchFactorEntry>* out
 ) {
     using nat = typename get_native_data_type<T>::type;
     CUDA_TOKEN_CHECK(cudaSetDevice(device_id));
@@ -373,6 +313,25 @@ static ffi::Error PbatchTokenAnalyze(
     CUDSS_TOKEN_CHECK(cudssCreate(&e->handle), "cudssCreate");
     CUDSS_TOKEN_CHECK(cudssSetStream(e->handle, stream), "cudssSetStream");
     CUDSS_TOKEN_CHECK(cudssConfigCreate(&e->config), "cudssConfigCreate");
+    if (reordering_id < 0 || reordering_id > CUDSS_REORDERING_ALG_NONE) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: invalid reordering_id (cudssReorderingAlg_t: "
+            "0 default, 1 btf_colamd, 2 colamd, 3 amd, 4 nested_dissection, 5 none)");
+    }
+    if (reordering_id) {
+        auto alg = static_cast<cudssReorderingAlg_t>(reordering_id);
+        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_REORDERING_ALG,
+                                         &alg, sizeof(alg)), "cudssConfigSet reordering");
+    }
+    if (memory_id != 0 && memory_id != 1) {
+        return ffi::Error::Internal(
+            "spineax pbatch token: invalid memory_id (0 device, 1 hybrid host+device)");
+    }
+    if (memory_id) {
+        int hybrid = 1;
+        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_HYBRID_MEMORY_MODE,
+                                         &hybrid, sizeof(hybrid)), "cudssConfigSet hybrid memory");
+    }
     CUDSS_TOKEN_CHECK(cudssDataCreate(e->handle, &e->data), "cudssDataCreate");
 
     // Point the descriptor at THIS call's buffers; every later phase repoints
@@ -396,20 +355,50 @@ static ffi::Error PbatchTokenAnalyze(
 
     CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_ANALYSIS,
         e->config, e->data, e->A, e->x_dummy, e->b_dummy), "cudssExecute analysis");
-    e->phase = BatchFactorEntry::kAnalyzed;
-    CUDA_TOKEN_CHECK(cudaEventRecord(e->done, stream));
-
-    int32_t id = BatchTokenRegistry::instance().insert(std::move(e));
-    CUDA_TOKEN_CHECK(cudaMemcpyAsync(token_buf->typed_data(), &id, sizeof(int32_t),
-                                     cudaMemcpyHostToDevice, stream));
-    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));  // id is a stack local
+    *out = std::move(e);
     return ffi::Error::Success();
 }
 
-// factorize / refactorize: block numeric phase ===============================
-// Pure phase execution: the only output is the token (dataflow). All post-
-// factorization data — diag, permutations, inertia inputs — comes from the
-// query handler below, so there is exactly one way to read it.
+// Write `id` to every slot of the token result buffer (1 or B equal copies).
+static ffi::Error token_write_id(cudaStream_t stream,
+                                 ffi::ResultBuffer<ffi::S32>& token_buf,
+                                 int32_t id) {
+    std::vector<int32_t> ids(token_buf->element_count(), id);
+    CUDA_TOKEN_CHECK(cudaMemcpyAsync(token_buf->typed_data(), ids.data(),
+                                     ids.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice, stream));
+    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));  // ids is a stack local
+    return ffi::Error::Success();
+}
+
+// analyze: fresh entry, ANALYSIS only =========================================
+template <ffi::DataType T>
+static ffi::Error PbatchTokenAnalyze(
+    cudaStream_t stream,
+    ffi::Buffer<T> csr_values_buf,
+    ffi::Buffer<ffi::S32> offsets_buf,
+    ffi::Buffer<ffi::S32> columns_buf,
+    ffi::Buffer<ffi::U32> fingerprint_buf,
+    ffi::ResultBuffer<ffi::S32> token_buf,  // int32[1]
+    const int64_t batch_size,
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id,
+    const int64_t reordering_id,
+    const int64_t memory_id
+) {
+    std::shared_ptr<BatchFactorEntry> e;
+    if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
+                                   columns_buf, fingerprint_buf, batch_size,
+                                   device_id, mtype_id, mview_id,
+                                   reordering_id, memory_id, &e);
+        err.failure()) return err;
+    CUDA_TOKEN_CHECK(cudaEventRecord(e->done, stream));
+    int32_t id = BatchTokenRegistry::instance().insert(std::move(e));
+    return token_write_id(stream, token_buf, id);
+}
+
+// factorize / refactorize: block numeric phase ================================
 template <ffi::DataType T, bool kRefactorize>
 static ffi::Error PbatchTokenNumeric(
     cudaStream_t stream,
@@ -418,44 +407,50 @@ static ffi::Error PbatchTokenNumeric(
     ffi::Buffer<ffi::S32> columns_buf,      // (B*nnz,) expanded
     ffi::Buffer<ffi::U32> fingerprint_buf,  // uint32[2] structure checksum
     ffi::Buffer<T> csr_values_buf,          // (B*nnz,)
-    ffi::Buffer<ffi::S32> ir_buf,           // int32[1]
-    ffi::ResultBuffer<ffi::S32> token_out   // same count, same ids
+    ffi::ResultBuffer<ffi::S32> token_out,  // same count, FRESH id
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id,
+    const int64_t reordering_id,
+    const int64_t memory_id
 ) {
+    auto& r = BatchTokenRegistry::instance();
     std::shared_ptr<BatchFactorEntry> e;
-    if (auto err = token_begin_phase<T>(stream, token_in, &e); err.failure()) return err;
+    int32_t id = 0;
+    if (auto err = token_begin_phase<T>(stream, token_in, &e, &id);
+        err.failure()) return err;
 
-    if (kRefactorize && e->phase < BatchFactorEntry::kFactorized) {
-        return ffi::Error::Internal(
-            "spineax pbatch token: refactorize requires a factorized token (call factorize first)");
+    const bool rebuilt = !e;
+    if (rebuilt) {
+        // Input state not resident: rebuild from this call's own buffers.
+        // The old pivot order went with the old entry, so a refactorize
+        // rebuild is a fresh full factorization too. The expanded structure
+        // IS the system here, hence batch_size 1.
+        if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
+                                       columns_buf, fingerprint_buf, 1,
+                                       device_id, mtype_id, mview_id,
+                                       reordering_id, memory_id, &e);
+            err.failure()) return err;
+        r.rebuilds.fetch_add(1);
+    } else {
+        if (auto err = batch_token_repoint<T>(e.get(), stream, offsets_buf,
+                                              columns_buf, fingerprint_buf,
+                                              csr_values_buf); err.failure()) return err;
     }
-
-    int32_t ir = 0;
-    CUDA_TOKEN_CHECK(cudaMemcpyAsync(&ir, ir_buf.typed_data(), sizeof(int32_t),
-                                     cudaMemcpyDeviceToHost, stream));
-    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));
-    if (ir != e->ir_nsteps) {
-        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_IR_N_STEPS,
-                                         &ir, sizeof(ir)), "cudssConfigSet ir_nsteps");
-        e->ir_nsteps = ir;
-    }
-    if (auto err = batch_token_repoint<T>(e.get(), stream, offsets_buf,
-                                          columns_buf, fingerprint_buf,
-                                          csr_values_buf); err.failure()) return err;
-
     CUDSS_TOKEN_CHECK(cudssExecute(e->handle,
-        kRefactorize ? CUDSS_PHASE_REFACTORIZATION : CUDSS_PHASE_FACTORIZATION,
+        (kRefactorize && !rebuilt) ? CUDSS_PHASE_REFACTORIZATION
+                                   : CUDSS_PHASE_FACTORIZATION,
         e->config, e->data, e->A, e->x_dummy, e->b_dummy),
         "cudssExecute factorization");
-    e->phase = BatchFactorEntry::kFactorized;
-
-    CUDA_TOKEN_CHECK(cudaMemcpyAsync(token_out->typed_data(), token_in.typed_data(),
-                                     token_in.element_count() * sizeof(int32_t),
-                                     cudaMemcpyDeviceToDevice, stream));
     CUDA_TOKEN_CHECK(cudaEventRecord(e->done, stream));
-    return ffi::Error::Success();
+
+    // A numeric phase consumes its input state's name: the entry moves to a
+    // fresh id, so every id ever handed out names one immutable state.
+    int32_t new_id = rebuilt ? r.insert(e) : r.rekey(id, e);
+    return token_write_id(stream, token_out, new_id);
 }
 
-// solve: block SOLVE (multi-RHS via the layout identity on the block system) =
+// solve: block SOLVE (multi-RHS via the layout identity on the block system)
 template <ffi::DataType T>
 static ffi::Error PbatchTokenSolve(
     cudaStream_t stream,
@@ -465,15 +460,41 @@ static ffi::Error PbatchTokenSolve(
     ffi::Buffer<ffi::U32> fingerprint_buf,  // uint32[2] structure checksum
     ffi::Buffer<T> csr_values_buf,          // (B*nnz,) — last-factorized values
     ffi::Buffer<T> b_values_buf,            // (B*n,) or (R, B*n) row-major
-    ffi::Buffer<ffi::S32> ir_buf,           // int32[1]
-    ffi::ResultBuffer<T> out_values_buf
+    ffi::ResultBuffer<T> out_values_buf,
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id,
+    const int64_t reordering_id,
+    const int64_t memory_id
 ) {
     std::shared_ptr<BatchFactorEntry> e;
-    if (auto err = token_begin_phase<T>(stream, token_in, &e); err.failure()) return err;
+    int32_t id = 0;
+    if (auto err = token_begin_phase<T>(stream, token_in, &e, &id);
+        err.failure()) return err;
 
-    if (e->phase < BatchFactorEntry::kFactorized) {
-        return ffi::Error::Internal(
-            "spineax pbatch token: solve requires a factorized token (call factorize first)");
+    if (!e) {
+        // Not resident: rebuild the token's state — its values buffer is by
+        // contract the values that produced its factors — and heal in place
+        // under the caller's id, so later solves of this token hit.
+        if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
+                                       columns_buf, fingerprint_buf, 1,
+                                       device_id, mtype_id, mview_id,
+                                       reordering_id, memory_id, &e);
+            err.failure()) return err;
+        CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
+            e->config, e->data, e->A, e->x_dummy, e->b_dummy),
+            "cudssExecute factorization (rebuild)");
+        auto& r = BatchTokenRegistry::instance();
+        r.rebuilds.fetch_add(1);
+        r.insert(e, id);
+    } else {
+        // SOLVE never reads A's values (spineax runs cuDSS-internal IR
+        // permanently OFF; refinement is JAX-side in _refined_solve), but
+        // repointing at this call's live buffers keeps every path
+        // zero-copy-safe and fingerprint-checked.
+        if (auto err = batch_token_repoint<T>(e.get(), stream, offsets_buf,
+                                              columns_buf, fingerprint_buf,
+                                              csr_values_buf); err.failure()) return err;
     }
     const int64_t N = e->batch * e->block_n;
     if (N == 0 || (int64_t)b_values_buf.element_count() % N != 0) {
@@ -483,21 +504,6 @@ static ffi::Error PbatchTokenSolve(
             " is not a multiple of batch*n = " + std::to_string(N));
     }
     int64_t nrhs = b_values_buf.element_count() / N;
-
-    int32_t ir = 0;
-    CUDA_TOKEN_CHECK(cudaMemcpyAsync(&ir, ir_buf.typed_data(), sizeof(int32_t),
-                                     cudaMemcpyDeviceToHost, stream));
-    CUDA_TOKEN_CHECK(cudaStreamSynchronize(stream));
-    if (ir != e->ir_nsteps) {
-        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_IR_N_STEPS,
-                                         &ir, sizeof(ir)), "cudssConfigSet ir_nsteps");
-        e->ir_nsteps = ir;
-    }
-    // A's values are read by SOLVE only when ir_nsteps > 0, but repointing at
-    // this call's live buffers is what keeps every path zero-copy-safe.
-    if (auto err = batch_token_repoint<T>(e.get(), stream, offsets_buf,
-                                          columns_buf, fingerprint_buf,
-                                          csr_values_buf); err.failure()) return err;
 
     cudssMatrix_t bmat = nullptr, xmat = nullptr;
     CUDSS_TOKEN_CHECK(cudssMatrixCreateDn(&bmat, N, nrhs, N,
@@ -520,11 +526,7 @@ static ffi::Error PbatchTokenSolve(
     return ffi::Error::Success();
 }
 
-// query: read every cuDSS data item from a factorized token =================
-// Subsumes single_solve_re.cpp: everything is returned unconditionally
-// (zero-filled where cuDSS declines for this matrix type / config) and Python
-// figures out what it wants. Array outputs are sized by the block system
-// (N = batch * block_n); scalar outputs are block-global.
+// query: read every cuDSS data item from a factorized token ===================
 static constexpr int64_t kNdPartitionTreeSize = (1 << 10) - 1;  // nd_nlevels=10 default
 
 template <ffi::DataType T>
@@ -547,10 +549,16 @@ static ffi::Error PbatchTokenQuery(
     ffi::ResultBuffer<ffi::S64> schur_shape_buf        // [2]
 ) {
     std::shared_ptr<BatchFactorEntry> e;
-    if (auto err = token_begin_phase<T>(stream, token_in, &e); err.failure()) return err;
-    if (e->phase < BatchFactorEntry::kFactorized) {
+    int32_t id = 0;
+    if (auto err = token_begin_phase<T>(stream, token_in, &e, &id);
+        err.failure()) return err;
+    if (!e) {
         return ffi::Error::Internal(
-            "spineax token: query requires a factorized token (call factorize first)");
+            "spineax token: unknown or evicted factorization token " +
+            std::to_string(id) + " — numeric phases and solve self-heal by "
+            "rebuilding, but query carries no CSR data to rebuild from. "
+            "Query nearer the factorization, or raise SPINEAX_FACTOR_CACHE "
+            "(capacity " + std::to_string(BatchTokenRegistry::capacity()) + ")");
     }
 
     const int64_t N = e->batch * e->block_n;
@@ -627,7 +635,9 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("batch_size") \
             .Attr<int64_t>("device_id") \
             .Attr<int64_t>("mtype_id") \
-            .Attr<int64_t>("mview_id")); \
+            .Attr<int64_t>("mview_id") \
+            .Attr<int64_t>("reordering_id") \
+            .Attr<int64_t>("memory_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenFactorize##TypeName, (PbatchTokenNumeric<DataType, false>), \
         ffi::Ffi::Bind() \
@@ -637,8 +647,12 @@ static ffi::Error PbatchTokenQuery(
             .Arg<ffi::Buffer<ffi::S32>>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Ret<ffi::Buffer<ffi::S32>>()); \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id") \
+            .Attr<int64_t>("reordering_id") \
+            .Attr<int64_t>("memory_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenRefactorize##TypeName, (PbatchTokenNumeric<DataType, true>), \
         ffi::Ffi::Bind() \
@@ -648,8 +662,12 @@ static ffi::Error PbatchTokenQuery(
             .Arg<ffi::Buffer<ffi::S32>>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Ret<ffi::Buffer<ffi::S32>>()); \
+            .Ret<ffi::Buffer<ffi::S32>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id") \
+            .Attr<int64_t>("reordering_id") \
+            .Attr<int64_t>("memory_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenSolve##TypeName, PbatchTokenSolve<DataType>, \
         ffi::Ffi::Bind() \
@@ -660,8 +678,12 @@ static ffi::Error PbatchTokenQuery(
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
             .Arg<ffi::Buffer<DataType>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Ret<ffi::Buffer<DataType>>()); \
+            .Ret<ffi::Buffer<DataType>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id") \
+            .Attr<int64_t>("reordering_id") \
+            .Attr<int64_t>("memory_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenQuery##TypeName, PbatchTokenQuery<DataType>, \
         ffi::Ffi::Bind() \
@@ -714,6 +736,9 @@ NB_MODULE(pbatch_solve, m) {
     });
     m.def("token_cache_capacity", []() {
         return BatchTokenRegistry::instance().capacity();
+    });
+    m.def("token_rebuild_count", []() {
+        return BatchTokenRegistry::instance().rebuilds.load();
     });
     m.def("nd_partition_tree_size", []() {
         return kNdPartitionTreeSize;

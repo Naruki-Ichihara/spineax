@@ -1,6 +1,8 @@
-"""Example: all five cuDSS matrix types through the token API."""
+"""Example: all five cuDSS matrix types through the token API, plus the
+per-factorization cuDSS knobs (reordering algorithm, factor storage)."""
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
+import numpy as np
 from spineax import cudss
 
 
@@ -34,6 +36,38 @@ def test_solver_types(mtype_id):
     print(f"x: {x}")
     print(f"max err vs dense solve: {jnp.max(jnp.abs(x - true_x1)):.2e}")
 
+def _random_symmetric(n=200):
+    # large enough that the reordering's effect on factor fill is visible
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((n, n))
+    A = A + A.T + n * np.eye(n)
+    mask = (np.abs(A) > 1.2) | np.eye(n, dtype=bool)
+    A = jnp.asarray(np.where(mask, A, 0.0))
+    return A, jsparse.BCSR.fromdense(A), jnp.asarray(rng.standard_normal(n))
+
+
+def test_reordering_types(reordering_id):
+    # the reordering changes factor fill (lu_nnz from query), not the answer
+    A, sp, b = _random_symmetric()
+    token = cudss.analyze(sp.data, sp.indptr, sp.indices,
+                          mtype_id=1, mview_id=0, reordering_id=reordering_id)
+    token = cudss.factorize(token, sp.data)
+    x = cudss.solve(token, b)
+    lu_nnz = int(cudss.query(token)["lu_nnz"][0])
+    print(f"lu_nnz: {lu_nnz}")
+    print(f"max err vs dense solve: {jnp.max(jnp.abs(A @ x - b)):.2e}")
+
+
+def test_memory_types(memory_id):
+    # 1 = hybrid host+device factors, for factorizations bigger than VRAM
+    A, sp, b = _random_symmetric()
+    token = cudss.analyze(sp.data, sp.indptr, sp.indices,
+                          mtype_id=1, mview_id=0, memory_id=memory_id)
+    token = cudss.factorize(token, sp.data)
+    x = cudss.solve(token, b)
+    print(f"max err vs dense solve: {jnp.max(jnp.abs(A @ x - b)):.2e}")
+
+
 mtypes = [
     "general",
     "symmetric",
@@ -42,6 +76,28 @@ mtypes = [
     "hermitian_positive_definite"
 ]
 
+reordering_types = [
+    "default",
+    "btf_colamd",
+    "colamd",
+    "amd",
+    "nested_dissection",
+    "none"
+]
+
+memory_types = [
+    "default",
+    "hybrid"
+]
+
 for mtype_id, mtype in enumerate(mtypes):
     print(f"testing: {mtype}")
     test_solver_types(mtype_id)
+
+for reordering_id, reordering in enumerate(reordering_types):
+    print(f"testing reordering: {reordering}")
+    test_reordering_types(reordering_id)
+
+for memory_id, memory in enumerate(memory_types):
+    print(f"testing memory: {memory}")
+    test_memory_types(memory_id)

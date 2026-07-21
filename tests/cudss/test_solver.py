@@ -1034,31 +1034,91 @@ def test_lineax_general_operator():
 
 
 # lifetime =====================================================================
-def test_release():
+def test_release_then_self_heal():
     _require_gpu()
     values, offsets, columns, A = _sym_system()
     b = jnp.asarray(np.random.default_rng(16).standard_normal(A.shape[0]))
-    token = cudss.analyze(values, offsets, columns)
-    token = cudss.factorize(token, values)
+    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
     cudss.solve(token, b).block_until_ready()
 
     assert cudss.release(token) is True
     assert cudss.release(token) is False  # second release is a no-op
-    with pytest.raises(Exception, match="unknown or evicted"):
-        cudss.solve(token, b).block_until_ready()
+    # release frees the factors, not the token: the next solve rebuilds
+    r0 = cudss.rebuild_count()
+    x = cudss.solve(token, b)
+    assert _rel_err(A, x, b) < _TOL[jnp.float64]
+    assert cudss.rebuild_count() == r0 + 1
+    cudss.solve(token, b).block_until_ready()  # healed in place: no rebuild
+    assert cudss.rebuild_count() == r0 + 1
 
 
-def test_lru_eviction():
+def test_lru_eviction_self_heals():
     _require_gpu()
-    values, offsets, columns, _ = _sym_system()
-    b = jnp.asarray(np.random.default_rng(17).standard_normal(offsets.shape[0] - 1))
+    values, offsets, columns, A = _sym_system()
+    b = jnp.asarray(np.random.default_rng(17).standard_normal(A.shape[0]))
     cap = cudss.cache_capacity()
 
-    victim = cudss.analyze(values, offsets, columns)
-    victim = cudss.factorize(victim, values)
+    victim = cudss.factorize(cudss.analyze(values, offsets, columns), values)
     # cap fresh entries push the untouched victim out
     for _ in range(cap):
         cudss.analyze(values, offsets, columns).id.block_until_ready()
     assert cudss.registry_size() <= cap
+    r0 = cudss.rebuild_count()
+    x = cudss.solve(victim, b)  # evicted -> rebuilt from the token's arrays
+    assert _rel_err(A, x, b) < _TOL[jnp.float64]
+    assert cudss.rebuild_count() == r0 + 1
+    # query carries no CSR data, so it alone cannot heal
+    for _ in range(cap):
+        cudss.analyze(values, offsets, columns).id.block_until_ready()
     with pytest.raises(Exception, match="unknown or evicted"):
-        cudss.solve(victim, b).block_until_ready()
+        jax.block_until_ready(cudss.query(victim))
+
+
+def test_cudss_config_knobs():
+    """reordering_id/memory_id reach cuDSS, and survive eviction self-heal
+    (they are part of the token's rebuild recipe like mtype/mview)."""
+    _require_gpu()
+    values, offsets, columns, A = _sym_system(n=80)
+    b = jnp.asarray(np.random.default_rng(19).standard_normal(A.shape[0]))
+
+    lu = {}
+    for rid in (0, 5):  # default (fill-reducing) vs natural order
+        t = cudss.factorize(
+            cudss.analyze(values, offsets, columns, reordering_id=rid), values)
+        assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
+        lu[rid] = int(np.asarray(cudss.query(t)["lu_nnz"])[0])
+    assert lu[5] >= lu[0]
+
+    # hybrid host+device factors, evicted and healed with the same config
+    t = cudss.factorize(
+        cudss.analyze(values, offsets, columns, reordering_id=5, memory_id=1),
+        values)
+    for _ in range(cudss.cache_capacity()):
+        cudss.analyze(values, offsets, columns).id.block_until_ready()
+    assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
+    assert int(np.asarray(cudss.query(t)["lu_nnz"])[0]) == lu[5]
+
+    with pytest.raises(Exception, match="invalid reordering_id"):
+        cudss.analyze(values, offsets, columns,
+                      reordering_id=9).id.block_until_ready()
+
+
+def test_numeric_phases_rename():
+    """Every id names one immutable numeric state: factorize/refactorize
+    return fresh ids, and a superseded token self-heals to ITS OWN values —
+    the stale-token wrong-answer class is gone."""
+    _require_gpu()
+    values, offsets, columns, A = _sym_system()
+    b = jnp.asarray(np.random.default_rng(18).standard_normal(A.shape[0]))
+
+    t_an = cudss.analyze(values, offsets, columns)
+    t0 = cudss.factorize(t_an, values)
+    t1 = cudss.refactorize(t0, 2.0 * values)
+    ids = {int(np.asarray(t.id)[0]) for t in (t_an, t0, t1)}
+    assert len(ids) == 3
+
+    # t1 owns the entry; solving stale t0 rebuilds A's factors, not 2A's
+    x1 = cudss.solve(t1, b)
+    x0 = cudss.solve(t0, b)
+    assert _rel_err(2.0 * A, x1, b) < _TOL[jnp.float64]
+    assert _rel_err(A, x0, b) < _TOL[jnp.float64]
