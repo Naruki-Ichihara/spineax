@@ -980,9 +980,39 @@ def test_lineax_adapter():
     # lineax protocol, interoperating with the explicit token as state=
     x2 = lx.linear_solve(operator, b, solver, state=token).value
     np.testing.assert_allclose(np.asarray(x2), np.asarray(x), rtol=1e-12)
+    conjugated, _ = solver.conj(token, {})
+    assert conjugated is token
     sol = lx.linear_solve(operator, b, solver)
     assert _rel_err(A, sol.value, b) < 1e-10
     assert cudss.release(sol.state) is True
+
+
+def test_lineax_conjugates_complex_factor_state():
+    import lineax as lx
+
+    _require_gpu()
+    A = jnp.asarray([
+        [2.0 + 1.0j, 1.0 - 0.5j],
+        [0.25 + 2.0j, 3.0 - 0.75j],
+    ])
+    b = jnp.asarray([1.0 + 2.0j, -0.5 + 1.0j])
+    offsets = jnp.asarray([0, 2, 4], dtype=jnp.int32)
+    columns = jnp.asarray([0, 1, 0, 1], dtype=jnp.int32)
+    operator = cudss.CSROperator(A.reshape(-1), offsets, columns)
+    solver = cudss.CuDSS()
+
+    state = solver.init(operator, {})
+    conjugated, _ = jax.jit(solver.conj)(state, {})
+    expected = solver.init(lx.conj(operator), {})
+
+    actual_x = solver.solve(conjugated, b)
+    expected_x = solver.solve(expected, b)
+    np.testing.assert_allclose(np.asarray(actual_x), np.asarray(expected_x),
+                               rtol=1e-12, atol=1e-12)
+    assert _rel_err(np.conj(np.asarray(A)), actual_x, b) < 1e-12
+    assert cudss.release(state) is True
+    assert cudss.release(conjugated) is True
+    assert cudss.release(expected) is True
 
 
 def test_lineax_general_operator():
