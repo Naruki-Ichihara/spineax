@@ -1067,11 +1067,13 @@ def test_lru_eviction_self_heals():
     x = cudss.solve(victim, b)  # evicted -> rebuilt from the token's arrays
     assert _rel_err(A, x, b) < _TOL[jnp.float64]
     assert cudss.rebuild_count() == r0 + 1
-    # query carries no CSR data, so it alone cannot heal
+    # query heals too: evict again, then read diagnostics off the rebuild
     for _ in range(cap):
         cudss.analyze(values, offsets, columns).id.block_until_ready()
-    with pytest.raises(Exception, match="unknown or evicted"):
-        jax.block_until_ready(cudss.query(victim))
+    r1 = cudss.rebuild_count()
+    inr = cudss.inertia(cudss.query(victim))
+    np.testing.assert_array_equal(np.asarray(inr), [A.shape[0], 0])  # PD
+    assert cudss.rebuild_count() == r1 + 1
 
 
 def test_cudss_config_knobs():

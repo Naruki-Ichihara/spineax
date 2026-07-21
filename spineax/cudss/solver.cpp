@@ -178,8 +178,7 @@ static ffi::Error token_begin_phase(cudaStream_t stream,
         }
     }
     // Not resident (renamed away or evicted) is not an error: *out stays
-    // null and the caller rebuilds from its own operands, or raises (query,
-    // which carries no CSR data to rebuild from).
+    // null and the caller rebuilds from its own operands.
     if (!e) return ffi::Error::Success();
     if (e->dtype != get_cudss_data_type<T>()) {
         return ffi::Error::Internal(
@@ -533,6 +532,10 @@ template <ffi::DataType T>
 static ffi::Error PbatchTokenQuery(
     cudaStream_t stream,
     ffi::Buffer<ffi::S32> token_in,                    // 1 or B equal ids
+    ffi::Buffer<ffi::S32> offsets_buf,                 // (B*n + 1,) expanded
+    ffi::Buffer<ffi::S32> columns_buf,                 // (B*nnz,) expanded
+    ffi::Buffer<ffi::U32> fingerprint_buf,             // uint32[2] structure checksum
+    ffi::Buffer<T> csr_values_buf,                     // (B*nnz,) — last-factorized values
     ffi::ResultBuffer<ffi::S64> lu_nnz_buf,            // [1]
     ffi::ResultBuffer<ffi::S32> npivots_buf,           // [1]
     ffi::ResultBuffer<ffi::S32> inertia_buf,           // [2] cuDSS native (block-global)
@@ -546,19 +549,38 @@ static ffi::Error PbatchTokenQuery(
     ffi::ResultBuffer<ffi::F32> scale_col_buf,         // [N]
     ffi::ResultBuffer<ffi::S32> nd_partition_tree_buf, // [kNdPartitionTreeSize]
     ffi::ResultBuffer<ffi::S32> nsuperpanels_buf,      // [1]
-    ffi::ResultBuffer<ffi::S64> schur_shape_buf        // [2]
+    ffi::ResultBuffer<ffi::S64> schur_shape_buf,       // [2]
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id,
+    const int64_t reordering_id,
+    const int64_t memory_id
 ) {
     std::shared_ptr<BatchFactorEntry> e;
     int32_t id = 0;
     if (auto err = token_begin_phase<T>(stream, token_in, &e, &id);
         err.failure()) return err;
+
     if (!e) {
-        return ffi::Error::Internal(
-            "spineax token: unknown or evicted factorization token " +
-            std::to_string(id) + " — numeric phases and solve self-heal by "
-            "rebuilding, but query carries no CSR data to rebuild from. "
-            "Query nearer the factorization, or raise SPINEAX_FACTOR_CACHE "
-            "(capacity " + std::to_string(BatchTokenRegistry::capacity()) + ")");
+        // Same heal as solve: rebuild the token's factorized state from its
+        // own buffers, in place under the caller's id.
+        if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
+                                       columns_buf, fingerprint_buf, 1,
+                                       device_id, mtype_id, mview_id,
+                                       reordering_id, memory_id, &e);
+            err.failure()) return err;
+        CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
+            e->config, e->data, e->A, e->x_dummy, e->b_dummy),
+            "cudssExecute factorization (rebuild)");
+        auto& r = BatchTokenRegistry::instance();
+        r.rebuilds.fetch_add(1);
+        r.insert(e, id);
+    } else {
+        // repoint = size + structure-fingerprint validation (query reads no
+        // buffers itself, but should reject tampered tokens like every phase)
+        if (auto err = batch_token_repoint<T>(e.get(), stream, offsets_buf,
+                                              columns_buf, fingerprint_buf,
+                                              csr_values_buf); err.failure()) return err;
     }
 
     const int64_t N = e->batch * e->block_n;
@@ -689,6 +711,10 @@ static ffi::Error PbatchTokenQuery(
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::U32>>() \
+            .Arg<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S64>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
@@ -702,7 +728,12 @@ static ffi::Error PbatchTokenQuery(
             .Ret<ffi::Buffer<ffi::F32>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
-            .Ret<ffi::Buffer<ffi::S64>>());
+            .Ret<ffi::Buffer<ffi::S64>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id") \
+            .Attr<int64_t>("reordering_id") \
+            .Attr<int64_t>("memory_id"));
 
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f32, ffi::F32);
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f64, ffi::F64);
