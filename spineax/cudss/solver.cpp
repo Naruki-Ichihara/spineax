@@ -794,6 +794,8 @@ DEFINE_PBATCH_TOKEN_FFI_HANDLERS(c128, ffi::C128);
         return d; \
     });
 
+void register_csr_transpose_handlers(nb::module_& m);
+
 // generate all nanobind modules! :)
 NB_MODULE(pbatch_solve, m) {
 
@@ -801,6 +803,7 @@ NB_MODULE(pbatch_solve, m) {
     EXPORT_PBATCH_TOKEN_HANDLERS(m, f64);
     EXPORT_PBATCH_TOKEN_HANDLERS(m, c64);
     EXPORT_PBATCH_TOKEN_HANDLERS(m, c128);
+    register_csr_transpose_handlers(m);
 
     m.def("token_release", [](int32_t id) {
         return BatchTokenRegistry::instance().release(id);

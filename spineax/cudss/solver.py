@@ -40,6 +40,16 @@ for _s in _SUFFIXES:
         jax.ffi.register_ffi_target(
             f"spineax_token_{_op}_{_s}", _handlers[_op], platform="CUDA"
         )
+    jax.ffi.register_ffi_target(
+        f"spineax_csr_transpose_{_s}",
+        getattr(_ps, f"handler_{_s}")(),
+        platform="CUDA",
+    )
+jax.ffi.register_ffi_target(
+    "spineax_csr_transpose_order",
+    _ps.order_handler(),
+    platform="CUDA",
+)
 
 
 def _suffix(dtype) -> str:
@@ -180,20 +190,21 @@ _ffi_p.multiple_results = True
 
 
 @lru_cache(maxsize=None)
-def _ffi_eager(name, out_avals, attrs):
+def _ffi_eager(name, out_avals, attrs, has_side_effect):
     # eager binds execute through jit (one compiled call per unique config)
     return jax.jit(lambda *a: _ffi_p.bind(*a, name=name, out_avals=out_avals,
-                                          attrs=attrs))
+                                          attrs=attrs,
+                                          has_side_effect=has_side_effect))
 
 
-_ffi_p.def_impl(lambda *args, name, out_avals, attrs:
-                _ffi_eager(name, out_avals, attrs)(*args))
+_ffi_p.def_impl(lambda *args, name, out_avals, attrs, has_side_effect:
+                _ffi_eager(name, out_avals, attrs, has_side_effect)(*args))
 
 
 # issue #18 fixed by Igor Kuszczak - no need for effectful things after token rework.
 @_ffi_p.def_abstract_eval
-def _ffi_abstract_eval(*avals_in, name, out_avals, attrs):
-    del avals_in, name, attrs
+def _ffi_abstract_eval(*avals_in, name, out_avals, attrs, has_side_effect):
+    del avals_in, name, attrs, has_side_effect
     return list(out_avals)
 
 
@@ -211,7 +222,7 @@ def _ir_tensor_type(aval):
     return _ir.RankedTensorType.get(aval.shape, et)
 
 
-def _ffi_lowering(ctx, *operands, name, out_avals, attrs):
+def _ffi_lowering(ctx, *operands, name, out_avals, attrs, has_side_effect):
     del out_avals  # ctx.avals_out is authoritative
     # Build the stablehlo.custom_call directly: the TYPED_FFI form is
     # api_version=4 with a DICTIONARY backend_config (the stablehlo verifier
@@ -226,7 +237,7 @@ def _ffi_lowering(ctx, *operands, name, out_avals, attrs):
 
     attributes = dict(
         call_target_name=_ir.StringAttr.get(name),
-        has_side_effect=_ir.BoolAttr.get(True),
+        has_side_effect=_ir.BoolAttr.get(has_side_effect),
         backend_config=_ir.DictAttr.get(
             {k: _ir.IntegerAttr.get(i64, int(v)) for k, v in attrs}),
         api_version=_ir.IntegerAttr.get(
@@ -248,7 +259,7 @@ def _ffi_lowering(ctx, *operands, name, out_avals, attrs):
 _jmlir.register_lowering(_ffi_p, _ffi_lowering)
 
 
-def _ffi_call4(name, out_specs, *operands, **attrs):
+def _ffi_call4(name, out_specs, *operands, has_side_effect=True, **attrs):
     """Emit one spineax typed-FFI custom call (explicit api_version 4).
 
     ``out_specs`` is a tuple of ShapeDtypeStructs; returns a list of arrays.
@@ -257,7 +268,8 @@ def _ffi_call4(name, out_specs, *operands, **attrs):
     out_avals = tuple(_ShapedArray(s.shape, jnp.dtype(s.dtype))
                       for s in out_specs)
     return _ffi_p.bind(*operands, name=name, out_avals=out_avals,
-                       attrs=tuple(sorted(attrs.items())))
+                       attrs=tuple(sorted(attrs.items())),
+                       has_side_effect=has_side_effect)
 
 
 # The per-entry cuDSS config, threaded as ONE tuple of i64 FFI attrs. It
@@ -425,7 +437,10 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
     ``reordering``: "default", "btf_colamd", "colamd", "amd",
     "nested_dissection" or "none" (natural order).
     ``memory``: "device" (default) or "hybrid" host+device factors.
-    Every knob also accepts the raw cuDSS enum int."""
+    Every knob also accepts the raw cuDSS enum int.
+
+    Column indices may be unsorted but must be unique within each row.
+    """
     cfg = (int(device_id),
            _knob_id(_MTYPE_IDS, mtype_id, "mtype"),
            _knob_id(_MVIEW_IDS, mview_id, "mview"),
@@ -679,18 +694,65 @@ def _matvec(token, x):
     return y.reshape(x.shape)
 
 
-def _transpose_csr(values, offsets, columns):
-    """(values, offsets, columns) of ``A^T`` for one flat CSR system:
-    the CSR of the transpose IS the CSC of A, obtained by a stable
-    reorder of the entries by (column, row). On-device jnp ops."""
+@jax.custom_batching.sequential_vmap
+def _raw_transpose_csr(values, offsets, columns):
     n = offsets.shape[0] - 1
-    rows = _pattern_rows(offsets, columns.shape[-1])
-    order = jnp.lexsort((rows, columns))
-    t_offsets = jnp.concatenate([
-        jnp.zeros((1,), jnp.int32),
-        jnp.cumsum(jnp.zeros((n,), jnp.int32).at[columns].add(1),
-                   dtype=jnp.int32)])
-    return values[order], t_offsets, rows[order]
+    nnz = values.shape[0]
+    return tuple(_ffi_call4(
+        f"spineax_csr_transpose_{_suffix(values.dtype)}",
+        (
+            jax.ShapeDtypeStruct((nnz,), values.dtype),
+            jax.ShapeDtypeStruct((n + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((nnz,), jnp.int32),
+        ),
+        values, offsets, columns, has_side_effect=False,
+    ))
+
+
+@jax.custom_batching.sequential_vmap
+def _transpose_csr_order(offsets, columns):
+    nnz = columns.shape[0]
+    identity = jnp.arange(nnz, dtype=jnp.int32)
+    (order,) = _ffi_call4(
+        "spineax_csr_transpose_order",
+        (jax.ShapeDtypeStruct((nnz,), jnp.int32),),
+        offsets, columns, identity, has_side_effect=False,
+    )
+    return order
+
+
+@jax.custom_jvp
+def _transpose_csr(values, offsets, columns):
+    """Return the CSR arrays of a square matrix transpose.
+
+    Column indices may be unsorted but must be unique within each row.
+    """
+    values = jnp.asarray(values)
+    offsets = jnp.asarray(offsets, dtype=jnp.int32)
+    columns = jnp.asarray(columns, dtype=jnp.int32)
+    if values.ndim != 1 or offsets.ndim != 1 or columns.ndim != 1:
+        raise ValueError("CSR values, offsets, and columns must be one-dimensional")
+    if values.shape != columns.shape:
+        raise ValueError("CSR values and columns must have equal lengths")
+    if offsets.shape[0] < 2:
+        raise ValueError("CSR offsets must describe at least one row")
+    return _raw_transpose_csr(values, offsets, columns)
+
+
+@_transpose_csr.defjvp
+def _transpose_csr_jvp(primals, tangents):
+    values, offsets, columns = primals
+    values_dot, _offsets_dot, _columns_dot = tangents
+    primal = _transpose_csr(values, offsets, columns)
+    offsets = jnp.asarray(offsets, dtype=jnp.int32)
+    columns = jnp.asarray(columns, dtype=jnp.int32)
+    order = _transpose_csr_order(offsets, columns)
+    tangent = (
+        jnp.take(values_dot, order),
+        jnp.zeros(offsets.shape, dtype=jax.dtypes.float0),
+        jnp.zeros(columns.shape, dtype=jax.dtypes.float0),
+    )
+    return primal, tangent
 
 
 def _transpose_solve_general(token, rhs, nsteps):
@@ -706,6 +768,8 @@ def _transpose_solve_general(token, rhs, nsteps):
     offs_bd, cols_bd, _ = _expand_structure(token.offsets, token.columns, B)
     t_vals, t_offs, t_cols = _transpose_csr(token.values.reshape(-1),
                                             offs_bd, cols_bd)
+    # TODO: remove the explicit transpose and second factorization when cuDSS
+    # implements nonzero CUDSS_CONFIG_SOLVE_MODE values.
     t_token = analyze(t_vals, t_offs, t_cols,
                       mtype_id=0, mview_id=0, device_id=token.device_id,
                       reordering=token.reordering_id,
@@ -862,6 +926,8 @@ class CSROperator(lx.AbstractLinearOperator):
         CSROperator(vals, offs, cols,
                     (lx.symmetric_tag,
                      lx.positive_semidefinite_tag))         # SPD
+
+    Column indices may be unsorted but must be unique within each row.
 
     Always the FULL sparsity pattern (both triangles; cuDSS ``mview_id=0``):
     ``mv`` is a plain BCSR matvec and a general matrix has no triangular
