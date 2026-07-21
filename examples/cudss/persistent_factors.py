@@ -2,9 +2,9 @@
 
 Every token id names ONE immutable numeric state: ``refactorize`` returns a
 fresh id, and using a superseded (or LRU-evicted, or released) state
-transparently rebuilds its factors from the token's own CSR arrays. Only
-``query`` cannot heal (it carries no CSR data). ``rebuild_count()`` counts
-the heals — a rising count means SPINEAX_FACTOR_CACHE is too small.
+transparently rebuilds its factors from the token's own CSR arrays — every
+phase, ``query`` included. ``rebuild_count()`` counts the heals — a rising
+count means SPINEAX_FACTOR_CACHE is too small.
 """
 import jax
 import jax.numpy as jnp

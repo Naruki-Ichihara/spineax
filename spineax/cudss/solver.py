@@ -65,9 +65,9 @@ class FactorToken(eqx.Module):
     An id names ONE immutable numeric state: ``factorize``/``refactorize``
     consume their input's id and return a fresh one. Using an id that is no
     longer resident (superseded, or LRU-evicted) transparently REBUILDS that
-    state from the token's own arrays — only ``query``, which carries no CSR
-    data, raises instead. ``rebuild_count()`` counts the heals; a rising
-    count means SPINEAX_FACTOR_CACHE is too small for the working set.
+    state from the token's own arrays — every phase, ``query`` included.
+    ``rebuild_count()`` counts the heals; a rising count means
+    SPINEAX_FACTOR_CACHE is too small for the working set.
 
     ``values``/``offsets``/``columns`` are zero-copy references to the
     caller's CSR arrays (the block pattern exactly as handed to ``analyze``,
@@ -731,11 +731,15 @@ _QUERY_SPLIT_FIELDS = frozenset({"diag", "scale_row", "scale_col"})
 
 
 @lru_cache(maxsize=None)
-def _make_query(suffix, dtype, n, tree):
-    """token.id -> tuple of the 14 query outputs for a system of dimension n."""
+def _make_query(suffix, dtype, n, tree, cfg):
+    """token -> tuple of the 14 query outputs for a system of dimension n.
+
+    The CSR arrays ride along like every other phase so a non-resident id
+    self-heals (and a resident one gets the fingerprint tamper check)."""
 
     @jax.custom_batching.custom_vmap
-    def query_id(token_id):
+    def query_id(token_id, offsets, columns, values):
+        offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
         outs = _ffi_call4(
             f"spineax_token_query_{suffix}",
             (
@@ -754,16 +758,21 @@ def _make_query(suffix, dtype, n, tree):
                 jax.ShapeDtypeStruct((1,), jnp.int32),        # nsuperpanels
                 jax.ShapeDtypeStruct((2,), jnp.int64),        # schur_shape
             ),
-            token_id)
+            token_id, offs_bd, cols_bd, fp, values,
+            **dict(zip(_CFG_KEYS, cfg)))
         return tuple(outs)
 
     @query_id.def_vmap
-    def _(axis_size, in_batched, token_id):
+    def _(axis_size, in_batched, token_id, offsets, columns, values):
         # Batched ids are B equal copies of ONE block entry: run a single
         # query on the whole B*n block system, then split the input-ordered
         # per-block fields to (B, n) and broadcast the block-global rest.
-        del in_batched
-        outs = _make_query(suffix, dtype, axis_size * n, tree)(token_id[0])
+        _, _, _, vb = in_batched
+        vals = values if vb else jnp.broadcast_to(
+            values, (axis_size,) + values.shape)
+        offs_bd, cols_bd, _ = _expand_structure(offsets, columns, axis_size)
+        outs = _make_query(suffix, dtype, axis_size * n, tree, cfg)(
+            token_id[0], offs_bd, cols_bd, vals.reshape(-1))
         batched = []
         for field, a in zip(_QUERY_FIELDS, outs):
             if field in _QUERY_SPLIT_FIELDS:
@@ -779,9 +788,18 @@ def query(token: FactorToken) -> dict:
     _require_factorized(token, "query")
     B = _batch_of(token)
     tree = int(_ps.nd_partition_tree_size())
-    fn = _make_query(_suffix(token.dtype), token.dtype, B * token.n, tree)
-    tid = token.id.reshape(-1)[:1] if token.id.ndim >= 2 else token.id
-    return dict(zip(_QUERY_FIELDS, fn(tid)))
+    fn = _make_query(_suffix(token.dtype), token.dtype, B * token.n, tree,
+                     _cfg_of(token))
+    if B > 1 or token.id.ndim >= 2:
+        # batch entry used eagerly: one query of the expanded block system,
+        # through the same custom_vmap wrapper (see _solve_impl)
+        offs_bd, cols_bd, _ = _expand_structure(token.offsets,
+                                                token.columns, B)
+        tid = token.id.reshape(-1)[:1]
+        outs = fn(tid, offs_bd, cols_bd, token.values.reshape(-1))
+    else:
+        outs = fn(token.id, token.offsets, token.columns, token.values)
+    return dict(zip(_QUERY_FIELDS, outs))
 
 
 def inertia(data: dict, batch_size: int = 1):
@@ -809,8 +827,7 @@ def inertia(data: dict, batch_size: int = 1):
 def release(token: FactorToken) -> bool:
     """manually free registry (only outside jit - otherwise whenever LRU overflows
     according to SPINEAX_FACTOR_CACHE). Using the token again after release
-    self-heals by rebuilding (query excepted), so this frees memory, not the
-    token."""
+    self-heals by rebuilding, so this frees memory, not the token."""
     return bool(_ps.token_release(int(jax.device_get(token.id).ravel()[0])))
 
 
