@@ -6,7 +6,7 @@ import numpy as np
 from spineax import cudss
 
 
-def test_solver_types(mtype_id):
+def test_solver_types(mtype):
 
     # example usage
     # -------------
@@ -28,7 +28,7 @@ def test_solver_types(mtype_id):
 
     # we are passing the whole LHS matrix in FULL (mview_id=0), on GPU 0
     token = cudss.analyze(csr_values1, csr_offsets1, csr_columns1,
-                       mtype_id=mtype_id, mview_id=0, device_id=0)
+                       mtype_id=mtype, mview_id="full", device_id=0)
     token = cudss.factorize(token, csr_values1)
     x = cudss.solve(token, b1)
 
@@ -46,11 +46,11 @@ def _random_symmetric(n=200):
     return A, jsparse.BCSR.fromdense(A), jnp.asarray(rng.standard_normal(n))
 
 
-def test_reordering_types(reordering_id):
+def test_reordering_types(reordering):
     # the reordering changes factor fill (lu_nnz from query), not the answer
     A, sp, b = _random_symmetric()
     token = cudss.analyze(sp.data, sp.indptr, sp.indices,
-                          mtype_id=1, mview_id=0, reordering_id=reordering_id)
+                          mtype_id=1, mview_id=0, reordering=reordering)
     token = cudss.factorize(token, sp.data)
     x = cudss.solve(token, b)
     lu_nnz = int(cudss.query(token)["lu_nnz"][0])
@@ -58,11 +58,11 @@ def test_reordering_types(reordering_id):
     print(f"max err vs dense solve: {jnp.max(jnp.abs(A @ x - b)):.2e}")
 
 
-def test_memory_types(memory_id):
-    # 1 = hybrid host+device factors, for factorizations bigger than VRAM
+def test_memory_types(memory):
+    # "hybrid" = host+device factors, for factorizations bigger than VRAM
     A, sp, b = _random_symmetric()
     token = cudss.analyze(sp.data, sp.indptr, sp.indices,
-                          mtype_id=1, mview_id=0, memory_id=memory_id)
+                          mtype_id=1, mview_id=0, memory=memory)
     token = cudss.factorize(token, sp.data)
     x = cudss.solve(token, b)
     print(f"max err vs dense solve: {jnp.max(jnp.abs(A @ x - b)):.2e}")
@@ -86,18 +86,18 @@ reordering_types = [
 ]
 
 memory_types = [
-    "default",
+    "device",
     "hybrid"
 ]
 
-for mtype_id, mtype in enumerate(mtypes):
+for mtype in mtypes:
     print(f"testing: {mtype}")
-    test_solver_types(mtype_id)
+    test_solver_types(mtype)
 
-for reordering_id, reordering in enumerate(reordering_types):
+for reordering in reordering_types:
     print(f"testing reordering: {reordering}")
-    test_reordering_types(reordering_id)
+    test_reordering_types(reordering)
 
-for memory_id, memory in enumerate(memory_types):
+for memory in memory_types:
     print(f"testing memory: {memory}")
-    test_memory_types(memory_id)
+    test_memory_types(memory)
