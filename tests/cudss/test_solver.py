@@ -156,10 +156,55 @@ def test_cusparse_transpose_transforms():
     np.testing.assert_array_equal(np.asarray(actual_offsets), np.asarray(expected[1]))
     np.testing.assert_array_equal(np.asarray(actual_columns), np.asarray(expected[2]))
 
-    with pytest.raises(ValueError, match="one shared sparsity pattern"):
-        jax.vmap(_transpose_csr, in_axes=(None, 0, None))(
-            values, jnp.stack((offsets, offsets)), columns
-        )
+
+def test_cusparse_transpose_batched_patterns():
+    """Per-example sparsity patterns under vmap: the rule collapses the
+    batch into ONE block-diagonal transpose (blockdiag(A_k)^T =
+    blockdiag(A_k^T)) and splits back — same construction as every other
+    spineax vmap rule."""
+    _require_gpu()
+    n, B = 6, 3
+    rng = np.random.default_rng(40)
+    cols_b = jnp.asarray(np.stack(
+        [np.stack([rng.permutation(n) for _ in range(n)]).reshape(-1)
+         for _ in range(B)]), jnp.int32)  # unsorted, unique per row
+    offsets = jnp.asarray(np.arange(n + 1) * n, jnp.int32)
+    vals_b = jnp.asarray(rng.standard_normal((B, n * n)))
+
+    tv, to, tc = jax.jit(jax.vmap(
+        _transpose_csr, in_axes=(0, None, 0)))(vals_b, offsets, cols_b)
+    for i in range(B):
+        ev, eo, ec, _ = _transpose_reference(
+            np.asarray(vals_b[i]), np.asarray(offsets), np.asarray(cols_b[i]))
+        np.testing.assert_array_equal(np.asarray(tv[i]), ev)
+        np.testing.assert_array_equal(np.asarray(to[i]), eo)
+        np.testing.assert_array_equal(np.asarray(tc[i]), ec)
+
+    # ...and through reverse mode of a vmapped GENERAL solve (the path that
+    # builds A^T per backward execution). Make the diagonal dominant: it
+    # sits wherever a row's (permuted) column index equals the row.
+    rows_flat = jnp.repeat(jnp.arange(n, dtype=jnp.int32), n)
+    vals_b = jnp.where(cols_b == rows_flat[None, :], 3.0 * n, vals_b)
+    b = jnp.asarray(rng.standard_normal((B, n)))
+
+    def loss(vals_b, b):
+        def one(v, c, bb):
+            t = cudss.analyze(v, offsets, c, mtype_id=0, mview_id=0)
+            t = cudss.factorize(t, v)
+            return cudss.solve(t, bb)
+        return jnp.sum(jax.vmap(one)(vals_b, cols_b, b) ** 2)
+
+    def dense_loss(vals_b, b):
+        def one(v, c, bb):
+            A = jnp.zeros((n, n)).at[
+                jnp.repeat(jnp.arange(n), n), c].set(v)
+            return jnp.linalg.solve(A, bb)
+        return jnp.sum(jax.vmap(one)(vals_b, cols_b, b) ** 2)
+
+    g = jax.jit(jax.grad(loss))(vals_b, b)
+    g_ref = jax.grad(dense_loss)(vals_b, b)
+    np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref),
+                               rtol=1e-9, atol=1e-9)
 
 
 def test_cusparse_transpose_complex_jvp_and_vjp():

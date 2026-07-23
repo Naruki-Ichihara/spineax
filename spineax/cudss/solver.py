@@ -712,31 +712,52 @@ def _raw_transpose_csr(values, offsets, columns):
 @_raw_transpose_csr.def_vmap
 def _(axis_size, in_batched, values, offsets, columns):
     values_batched, offsets_batched, columns_batched = in_batched
-    if offsets_batched or columns_batched:
-        raise ValueError(
-            "vmap(_transpose_csr) requires one shared sparsity pattern; "
-            "only values may be batched"
+
+    if not (offsets_batched or columns_batched):
+        # shared pattern: the transposed structure is batch-invariant and
+        # the values just permute — one unbatched order FFI + batched gather
+        if not values_batched:
+            values = jnp.broadcast_to(values, (axis_size,) + values.shape)
+        n = offsets.shape[0] - 1
+        order = _transpose_csr_order(offsets, columns)
+        rows = _pattern_rows(offsets, columns.shape[0])
+        counts = jnp.zeros((n,), dtype=jnp.int32).at[columns].add(1)
+        transposed_offsets = jnp.concatenate([
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.cumsum(counts, dtype=jnp.int32),
+        ])
+        outputs = (
+            jnp.take(values, order, axis=-1),
+            transposed_offsets,
+            jnp.take(rows, order),
         )
+        return outputs, (True, False, False)
 
-    if not values_batched:
-        values = jnp.broadcast_to(values, (axis_size,) + values.shape)
-
-    n = offsets.shape[0] - 1
-    order = _transpose_csr_order(offsets, columns)
-    rows = _pattern_rows(offsets, columns.shape[0])
-    counts = jnp.zeros((n,), dtype=jnp.int32).at[columns].add(1)
-    transposed_offsets = jnp.concatenate([
-        jnp.zeros((1,), dtype=jnp.int32),
-        jnp.cumsum(counts, dtype=jnp.int32),
-    ])
+    # per-example patterns: a batch of systems IS one block-diagonal system,
+    # and blockdiag(A_k)^T = blockdiag(A_k^T) — ONE flat transpose, split
+    # back per block. Recursing into the wrapped function (never the raw
+    # FFI) lets any outer vmap levels peel through this rule again. vmap
+    # guarantees uniform shapes, so each block holds exactly nnz entries,
+    # contiguous in the transposed block-diagonal CSR.
+    vals = values if values_batched else jnp.broadcast_to(
+        values, (axis_size,) + values.shape)
+    n = offsets.shape[-1] - 1
+    nnz = columns.shape[-1]
+    offs_bd, cols_bd, _ = _expand_structure(offsets, columns, axis_size)
+    t_vals, t_offs_bd, t_cols_bd = _raw_transpose_csr(
+        vals.reshape(-1), offs_bd, cols_bd)
+    k = jnp.arange(axis_size, dtype=jnp.int32)[:, None]
+    t_offs = (t_offs_bd[k * n + jnp.arange(n + 1, dtype=jnp.int32)]
+              - k * jnp.int32(nnz))
     outputs = (
-        jnp.take(values, order, axis=-1),
-        transposed_offsets,
-        jnp.take(rows, order),
+        t_vals.reshape(axis_size, nnz),
+        t_offs,
+        t_cols_bd.reshape(axis_size, nnz) - k * jnp.int32(n),
     )
-    return outputs, (True, False, False)
+    return outputs, (True, True, True)
 
 
+@jax.custom_batching.custom_vmap
 def _transpose_csr_order(offsets, columns):
     nnz = columns.shape[0]
     identity = jnp.arange(nnz, dtype=jnp.int32)
@@ -746,6 +767,19 @@ def _transpose_csr_order(offsets, columns):
         offsets, columns, identity, has_side_effect=False,
     )
     return order
+
+
+@_transpose_csr_order.def_vmap
+def _(axis_size, in_batched, offsets, columns):
+    # only reached with a batched pattern (a fully-shared call is hoisted
+    # out of vmap): block-diagonalize, then split — block k's entries occupy
+    # flat slots [k*nnz, (k+1)*nnz) on both sides of the permutation
+    del in_batched
+    nnz = columns.shape[-1]
+    offs_bd, cols_bd, _ = _expand_structure(offsets, columns, axis_size)
+    flat = _transpose_csr_order(offs_bd, cols_bd)
+    k = jnp.arange(axis_size, dtype=jnp.int32)[:, None]
+    return flat.reshape(axis_size, nnz) - k * jnp.int32(nnz), True
 
 
 @jax.custom_jvp
