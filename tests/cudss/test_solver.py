@@ -142,11 +142,24 @@ def test_cusparse_transpose_transforms():
         atol=1e-14,
     )
 
-    batch = jnp.stack((values, 2.0 * values))
-    actual_batch = jax.jit(jax.vmap(
-        lambda data: _transpose_csr(data, offsets, columns)[0]
-    ))(batch)
-    np.testing.assert_array_equal(np.asarray(actual_batch), np.asarray(batch[:, order]))
+    batch = jnp.stack((values, 2.0 * values, -values))
+    transpose_batch = jax.jit(jax.vmap(
+        _transpose_csr,
+        in_axes=(0, None, None),
+        out_axes=(0, None, None),
+    ))
+    actual_values, actual_offsets, actual_columns = transpose_batch(
+        batch, offsets, columns
+    )
+    expected = _transpose_reference(values, offsets, columns)
+    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(batch[:, order]))
+    np.testing.assert_array_equal(np.asarray(actual_offsets), np.asarray(expected[1]))
+    np.testing.assert_array_equal(np.asarray(actual_columns), np.asarray(expected[2]))
+
+    with pytest.raises(ValueError, match="one shared sparsity pattern"):
+        jax.vmap(_transpose_csr, in_axes=(None, 0, None))(
+            values, jnp.stack((offsets, offsets)), columns
+        )
 
 
 def test_cusparse_transpose_complex_jvp_and_vjp():
@@ -190,6 +203,18 @@ def test_cusparse_transpose_uses_explicit_typed_ffi():
     assert all("has_side_effect = true" not in line for line in calls)
     assert "stablehlo.sort" not in text
     assert "lexsort" not in text
+
+    batch = jnp.stack((values, 2.0 * values, -values))
+    transpose_batch = jax.jit(jax.vmap(
+        _transpose_csr,
+        in_axes=(0, None, None),
+        out_axes=(0, None, None),
+    ))
+    batched_text = transpose_batch.lower(batch, offsets, columns).as_text()
+    assert batched_text.count(
+        "stablehlo.custom_call @spineax_csr_transpose_order"
+    ) == 1
+    assert "stablehlo.custom_call @spineax_csr_transpose_f64" not in batched_text
 
 
 # correctness ==================================================================

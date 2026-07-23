@@ -694,7 +694,7 @@ def _matvec(token, x):
     return y.reshape(x.shape)
 
 
-@jax.custom_batching.sequential_vmap
+@jax.custom_batching.custom_vmap
 def _raw_transpose_csr(values, offsets, columns):
     n = offsets.shape[0] - 1
     nnz = values.shape[0]
@@ -709,7 +709,34 @@ def _raw_transpose_csr(values, offsets, columns):
     ))
 
 
-@jax.custom_batching.sequential_vmap
+@_raw_transpose_csr.def_vmap
+def _(axis_size, in_batched, values, offsets, columns):
+    values_batched, offsets_batched, columns_batched = in_batched
+    if offsets_batched or columns_batched:
+        raise ValueError(
+            "vmap(_transpose_csr) requires one shared sparsity pattern; "
+            "only values may be batched"
+        )
+
+    if not values_batched:
+        values = jnp.broadcast_to(values, (axis_size,) + values.shape)
+
+    n = offsets.shape[0] - 1
+    order = _transpose_csr_order(offsets, columns)
+    rows = _pattern_rows(offsets, columns.shape[0])
+    counts = jnp.zeros((n,), dtype=jnp.int32).at[columns].add(1)
+    transposed_offsets = jnp.concatenate([
+        jnp.zeros((1,), dtype=jnp.int32),
+        jnp.cumsum(counts, dtype=jnp.int32),
+    ])
+    outputs = (
+        jnp.take(values, order, axis=-1),
+        transposed_offsets,
+        jnp.take(rows, order),
+    )
+    return outputs, (True, False, False)
+
+
 def _transpose_csr_order(offsets, columns):
     nnz = columns.shape[0]
     identity = jnp.arange(nnz, dtype=jnp.int32)
