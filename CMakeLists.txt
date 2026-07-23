@@ -122,9 +122,17 @@ find_library(ENV_CUDSS_PATH
   REQUIRED
 )
 
+find_library(ENV_CUSPARSE_PATH
+  NAMES cusparse libcusparse libcusparse.so libcusparse.so.13 libcusparse.so.12
+  HINTS ${ENV_NVIDIA_LIB_DIRS}
+  NO_DEFAULT_PATH
+  REQUIRED
+)
+
 message(STATUS "Found libcudart at: ${ENV_CUDART_PATH}")
 message(STATUS "Found libcudss  at: ${ENV_CUDSS_PATH}")
 message(STATUS "Found libcublas at: ${ENV_CUBLAS_PATH}")
+message(STATUS "Found libcusparse at: ${ENV_CUSPARSE_PATH}")
 
 # --- Imported targets (clean linking) ---
 add_library(nvidia::cudart SHARED IMPORTED GLOBAL)
@@ -142,6 +150,12 @@ set_target_properties(nvidia::cudss PROPERTIES
 add_library(nvidia::cublas SHARED IMPORTED GLOBAL)
 set_target_properties(nvidia::cublas PROPERTIES
   IMPORTED_LOCATION "${ENV_CUBLAS_PATH}"
+  INTERFACE_INCLUDE_DIRECTORIES "${ENV_NVIDIA_INCLUDE_DIRS}"
+)
+
+add_library(nvidia::cusparse SHARED IMPORTED GLOBAL)
+set_target_properties(nvidia::cusparse PROPERTIES
+  IMPORTED_LOCATION "${ENV_CUSPARSE_PATH}"
   INTERFACE_INCLUDE_DIRECTORIES "${ENV_NVIDIA_INCLUDE_DIRS}"
 )
 
@@ -173,6 +187,7 @@ endif()
 # [tool.scikit-build.wheel] py-api = "cp312" so the wheel is tagged cp312-abi3.
 nanobind_add_module(pbatch_solve STABLE_ABI NOMINSIZE
   spineax/cudss/solver.cpp
+  spineax/cudss/csr_transpose.cpp
 )
 
 # Build list of targets
@@ -184,6 +199,7 @@ foreach(TARGET ${SPINEAX_TARGETS})
     nvidia::cudss
     nvidia::cudart
     nvidia::cublas
+    nvidia::cusparse
     ${ENV_NVIDIA_INCLUDE_DIRS}
   )
 
@@ -191,6 +207,7 @@ foreach(TARGET ${SPINEAX_TARGETS})
     nvidia::cudss
     nvidia::cudart
     nvidia::cublas
+    nvidia::cusparse
   )
 
   # Suppress warnings from XLA FFI headers that have control flow issues

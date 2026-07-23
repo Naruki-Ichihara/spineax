@@ -8,6 +8,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 from spineax import cudss
+from spineax.cudss.solver import _transpose_csr
 
 
 def _require_gpu():
@@ -64,6 +65,156 @@ _TOL = {
 def _rel_err(A, x, b):
     A, x, b = np.asarray(A), np.asarray(x), np.asarray(b)
     return np.linalg.norm(A @ x - b) / np.linalg.norm(b)
+
+
+def _transpose_reference(values, offsets, columns):
+    offsets = np.asarray(offsets)
+    columns = np.asarray(columns)
+    rows = np.repeat(np.arange(offsets.size - 1), np.diff(offsets))
+    order = np.lexsort((rows, columns))
+    counts = np.bincount(columns, minlength=offsets.size - 1)
+    transposed_offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
+    return values[order], transposed_offsets, rows[order].astype(np.int32), order
+
+
+@pytest.mark.parametrize(
+    "dtype", [jnp.float32, jnp.float64, jnp.complex64, jnp.complex128]
+)
+def test_cusparse_transpose_matches_lexsort(dtype):
+    _require_gpu()
+    offsets = jnp.asarray([0, 2, 2, 4, 6], dtype=jnp.int32)
+    columns = jnp.asarray([3, 1, 2, 0, 3, 1], dtype=jnp.int32)
+    base = np.asarray([1, 2, 3, 4, 5, 6], dtype=np.float64)
+    if jnp.issubdtype(dtype, jnp.complexfloating):
+        base = base + 1j * base[::-1]
+    values = jnp.asarray(base, dtype=dtype)
+    expected = _transpose_reference(values, offsets, columns)
+
+    actual = jax.jit(_transpose_csr)(values, offsets, columns)
+    for result, reference in zip(actual, expected[:3]):
+        np.testing.assert_array_equal(np.asarray(result), np.asarray(reference))
+
+
+def test_cusparse_transpose_empty_matrix():
+    _require_gpu()
+    values = jnp.empty((0,), dtype=jnp.float64)
+    offsets = jnp.zeros((4,), dtype=jnp.int32)
+    columns = jnp.empty((0,), dtype=jnp.int32)
+    transposed = jax.jit(_transpose_csr)(values, offsets, columns)
+    np.testing.assert_array_equal(np.asarray(transposed[0]), np.empty((0,)))
+    np.testing.assert_array_equal(np.asarray(transposed[1]), np.zeros((4,), np.int32))
+    np.testing.assert_array_equal(np.asarray(transposed[2]), np.empty((0,), np.int32))
+
+
+def test_cusparse_transpose_transforms():
+    _require_gpu()
+    offsets = jnp.asarray([0, 2, 2, 4, 6], dtype=jnp.int32)
+    columns = jnp.asarray([3, 1, 2, 0, 3, 1], dtype=jnp.int32)
+    values = jnp.asarray([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    tangent = jnp.asarray([-2.0, 3.0, 5.0, 7.0, 11.0, 13.0])
+    order = jnp.asarray(_transpose_reference(values, offsets, columns)[3])
+
+    primal, tangent_out = jax.jvp(
+        lambda data: _transpose_csr(data, offsets, columns)[0],
+        (values,),
+        (tangent,),
+    )
+    np.testing.assert_array_equal(np.asarray(primal), np.asarray(values[order]))
+    np.testing.assert_array_equal(np.asarray(tangent_out), np.asarray(tangent[order]))
+
+    cotangent = jnp.arange(values.size, dtype=values.dtype)
+    _, pullback = jax.vjp(
+        lambda data: _transpose_csr(data, offsets, columns)[0], values
+    )
+    expected_vjp = jnp.zeros_like(cotangent).at[order].set(cotangent)
+    np.testing.assert_array_equal(np.asarray(pullback(cotangent)[0]), expected_vjp)
+
+    def loss(data):
+        return jnp.sum(_transpose_csr(data, offsets, columns)[0] ** 4)
+
+    def reference_loss(data):
+        return jnp.sum(data[order] ** 4)
+
+    np.testing.assert_allclose(
+        np.asarray(jax.jit(jax.hessian(loss))(values)),
+        np.asarray(jax.hessian(reference_loss)(values)),
+        rtol=1e-14,
+        atol=1e-14,
+    )
+
+    batch = jnp.stack((values, 2.0 * values, -values))
+    transpose_batch = jax.jit(jax.vmap(
+        _transpose_csr,
+        in_axes=(0, None, None),
+        out_axes=(0, None, None),
+    ))
+    actual_values, actual_offsets, actual_columns = transpose_batch(
+        batch, offsets, columns
+    )
+    expected = _transpose_reference(values, offsets, columns)
+    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(batch[:, order]))
+    np.testing.assert_array_equal(np.asarray(actual_offsets), np.asarray(expected[1]))
+    np.testing.assert_array_equal(np.asarray(actual_columns), np.asarray(expected[2]))
+
+    with pytest.raises(ValueError, match="one shared sparsity pattern"):
+        jax.vmap(_transpose_csr, in_axes=(None, 0, None))(
+            values, jnp.stack((offsets, offsets)), columns
+        )
+
+
+def test_cusparse_transpose_complex_jvp_and_vjp():
+    _require_gpu()
+    offsets = jnp.asarray([0, 2, 2, 4, 6], dtype=jnp.int32)
+    columns = jnp.asarray([3, 1, 2, 0, 3, 1], dtype=jnp.int32)
+    values = jnp.asarray([1 + 2j, 2 - 3j, 3 + 5j, 4 - 7j, 5 + 11j, 6 - 13j])
+    tangent = jnp.asarray([-2 + 1j, 3 + 2j, 5 - 3j, 7 + 5j, 11 - 7j, 13 + 11j])
+    order = jnp.asarray(_transpose_reference(values, offsets, columns)[3])
+
+    primal, tangent_out = jax.jvp(
+        lambda data: _transpose_csr(data, offsets, columns)[0],
+        (values,),
+        (tangent,),
+    )
+    np.testing.assert_array_equal(np.asarray(primal), np.asarray(values[order]))
+    np.testing.assert_array_equal(np.asarray(tangent_out), np.asarray(tangent[order]))
+
+    cotangent = jnp.asarray([1 - 1j, 2 + 3j, 3 - 5j, 4 + 7j, 5 - 11j, 6 + 13j])
+    _, pullback = jax.vjp(
+        lambda data: _transpose_csr(data, offsets, columns)[0], values
+    )
+    expected = jnp.zeros_like(cotangent).at[order].set(cotangent)
+    np.testing.assert_array_equal(np.asarray(pullback(cotangent)[0]),
+                                  np.asarray(expected))
+
+
+def test_cusparse_transpose_uses_explicit_typed_ffi():
+    _require_gpu()
+    offsets = jnp.asarray([0, 2, 2, 4, 6], dtype=jnp.int32)
+    columns = jnp.asarray([3, 1, 2, 0, 3, 1], dtype=jnp.int32)
+    values = jnp.arange(columns.size, dtype=jnp.float64)
+
+    def loss(data):
+        return jnp.sum(_transpose_csr(data, offsets, columns)[0] ** 2)
+
+    text = jax.jit(jax.value_and_grad(loss)).lower(values).as_text()
+    calls = [line for line in text.splitlines() if "spineax_csr_transpose" in line]
+    assert calls
+    assert all("api_version = 4" in line for line in calls)
+    assert all("has_side_effect = true" not in line for line in calls)
+    assert "stablehlo.sort" not in text
+    assert "lexsort" not in text
+
+    batch = jnp.stack((values, 2.0 * values, -values))
+    transpose_batch = jax.jit(jax.vmap(
+        _transpose_csr,
+        in_axes=(0, None, None),
+        out_axes=(0, None, None),
+    ))
+    batched_text = transpose_batch.lower(batch, offsets, columns).as_text()
+    assert batched_text.count(
+        "stablehlo.custom_call @spineax_csr_transpose_order"
+    ) == 1
+    assert "stablehlo.custom_call @spineax_csr_transpose_f64" not in batched_text
 
 
 # correctness ==================================================================
@@ -138,13 +289,14 @@ def test_explicit_typed_ffi_api_version():
         return cudss.solve(t, b, ir_nsteps=1), cudss.inertia(cudss.query(t))
 
     txt = jax.jit(full).lower(values, b).as_text()
-    calls = [l for l in txt.splitlines() if "spineax_token" in l]
+    calls = [line for line in txt.splitlines() if "spineax_token" in line]
     assert len(calls) >= 4  # analyze, factorize, query, solve(s)
-    assert all("api_version = 4" in l for l in calls)
+    assert all("api_version = 4" in line for line in calls)
+    assert all("has_side_effect = true" in line for line in calls)
     assert "mhlo.backend_config" not in txt
     # analyze's static config rides the backend_config DICT attribute
-    (al,) = [l for l in calls if "analyze" in l]
-    assert "mtype_id = 1" in al and "batch_size = 1" in al
+    (analyze_line,) = [line for line in calls if "analyze" in line]
+    assert "mtype_id = 1" in analyze_line and "batch_size = 1" in analyze_line
 
 
 def test_refactorize():
@@ -865,6 +1017,42 @@ def test_grad_general_mtype():
                                rtol=1e-9, atol=1e-9)
 
 
+def test_grad_general_complex_through_checkpoint():
+    _require_gpu()
+    n = 7
+    rng = np.random.default_rng(34)
+    A = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    A = A + 2 * n * np.eye(n)
+    columns = jnp.asarray(np.tile(np.arange(n, dtype=np.int32), n))
+    offsets = jnp.asarray(np.arange(n + 1, dtype=np.int32) * n)
+    vals = jnp.asarray(A.reshape(-1))
+    b = jnp.asarray(rng.standard_normal(n) + 1j * rng.standard_normal(n))
+
+    def system_solve(v, b):
+        token = cudss.analyze(v, offsets, columns, mtype_id=0, mview_id=0)
+        token = cudss.factorize(token, v)
+        return cudss.solve(token, b)
+
+    def loss(v, b):
+        x = system_solve(v, b)
+        return jnp.real(jnp.vdot(x, x))
+
+    def checkpoint_loss(v, b):
+        x = jax.checkpoint(system_solve)(v, b)
+        return jnp.real(jnp.vdot(x, x))
+
+    def dense_loss(v, b):
+        x = jnp.linalg.solve(v.reshape(n, n), b)
+        return jnp.real(jnp.vdot(x, x))
+
+    expected = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
+    for candidate in (loss, checkpoint_loss):
+        actual = jax.jit(jax.grad(candidate, argnums=(0, 1)))(vals, b)
+        for result, reference in zip(actual, expected):
+            np.testing.assert_allclose(np.asarray(result), np.asarray(reference),
+                                       rtol=1e-9, atol=1e-9)
+
+
 def test_grad_hermitian_complex():
     """Reverse mode through a hermitian (mtype 2) complex solve: the adjoint
     reuses the forward factors via A^T x = c <=> x = conj(A^-1 conj(c))."""
@@ -1157,3 +1345,29 @@ def test_numeric_phases_rename():
     x0 = cudss.solve(t0, b)
     assert _rel_err(2.0 * A, x1, b) < _TOL[jnp.float64]
     assert _rel_err(A, x0, b) < _TOL[jnp.float64]
+
+
+def test_concurrent_refactors_branch_from_one_token():
+    from concurrent.futures import ThreadPoolExecutor
+
+    _require_gpu()
+    values, offsets, columns, A = _sym_system(n=80, seed=35)
+    b = jnp.asarray(np.random.default_rng(36).standard_normal(A.shape[0]))
+    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+
+    # Compile before dispatching the same resident state from two host threads.
+    warm = cudss.refactorize(token, 1.5 * values)
+    warm.id.block_until_ready()
+    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+
+    def branch(scale):
+        result = cudss.refactorize(token, scale * values)
+        result.id.block_until_ready()
+        return result
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        branches = list(pool.map(branch, (2.0, 3.0)))
+
+    for scale, result in zip((2.0, 3.0), branches):
+        assert _rel_err(scale * A, cudss.solve(result, b), b) < _TOL[jnp.float64]
+    assert _rel_err(A, cudss.solve(token, b), b) < _TOL[jnp.float64]
