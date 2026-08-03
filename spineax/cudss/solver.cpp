@@ -31,6 +31,16 @@ template<> struct get_native_data_type<ffi::F64> { using type = double; };
 template<> struct get_native_data_type<ffi::C64> { using type = std::complex<float>; };
 template<> struct get_native_data_type<ffi::C128> { using type = std::complex<double>; };
 
+// CSR index width is configurable per-array (offsets and columns independently):
+// the dtype is carried by the buffer itself (ffi::AnyBuffer), so no FFI attribute
+// is needed — the handler auto-detects it from the operand's element type.
+static cudssDataType_t cudss_index_type(ffi::DataType dt, const char* what) {
+    (void)what;
+    if (dt == ffi::DataType::S32) return CUDSS_R_32I;
+    if (dt == ffi::DataType::S64) return CUDSS_R_64I;
+    return CUDSS_R_32I;  // caller validates (see create_entry)
+}
+
 #define CUDSS_TOKEN_CHECK(call, msg) \
     do { \
         cudssStatus_t s_ = (call); \
@@ -244,8 +254,8 @@ static ffi::Error token_begin_phase(cudaStream_t stream,
 template <ffi::DataType T>
 static ffi::Error batch_token_repoint(
     BatchFactorEntry* e, cudaStream_t stream,
-    ffi::Buffer<ffi::S32>& offsets_buf,     // (B*n + 1,) expanded
-    ffi::Buffer<ffi::S32>& columns_buf,     // (B*nnz,) expanded
+    ffi::AnyBuffer offsets_buf,              // (B*n + 1,) expanded (int32/int64)
+    ffi::AnyBuffer columns_buf,             // (B*nnz,) expanded (int32/int64)
     ffi::Buffer<ffi::U32>& fingerprint_buf, // uint32[2] structure checksum
     ffi::Buffer<T>& values_buf              // (B*nnz,) block values
 ) {
@@ -280,7 +290,7 @@ static ffi::Error batch_token_repoint(
             "pattern instead of editing the token's leaves.");
     }
     CUDSS_TOKEN_CHECK(cudssMatrixSetCsrPointers(e->A,
-        offsets_buf.typed_data(), NULL, columns_buf.typed_data(),
+        offsets_buf.untyped_data(), NULL, columns_buf.untyped_data(),
         values_buf.typed_data()), "cudssMatrixSetCsrPointers");
     return ffi::Error::Success();
 }
@@ -292,8 +302,8 @@ template <ffi::DataType T>
 static ffi::Error create_entry(
     cudaStream_t stream,
     ffi::Buffer<T>& csr_values_buf,          // (B*nnz,) contiguous == block values
-    ffi::Buffer<ffi::S32>& offsets_buf,      // (B*n + 1,) expanded
-    ffi::Buffer<ffi::S32>& columns_buf,      // (B*nnz,) expanded
+    ffi::AnyBuffer offsets_buf,              // (B*n + 1,) expanded (int32/int64)
+    ffi::AnyBuffer columns_buf,             // (B*nnz,) expanded (int32/int64)
     ffi::Buffer<ffi::U32>& fingerprint_buf,  // uint32[2] structure checksum
     const int64_t batch_size,
     const int64_t device_id,
@@ -301,6 +311,7 @@ static ffi::Error create_entry(
     const int64_t mview_id,
     const int64_t reordering_id,
     const int64_t memory_id,
+    const int64_t hybrid_device_memory_limit,
     std::shared_ptr<BatchFactorEntry>* out
 ) {
     using nat = typename get_native_data_type<T>::type;
@@ -373,16 +384,32 @@ static ffi::Error create_entry(
         int hybrid = 1;
         CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_HYBRID_MEMORY_MODE,
                                          &hybrid, sizeof(hybrid)), "cudssConfigSet hybrid memory");
+        if (hybrid_device_memory_limit > 0) {
+            int64_t lim = hybrid_device_memory_limit;
+            CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_HYBRID_DEVICE_MEMORY_LIMIT,
+                                             &lim, sizeof(lim)), "cudssConfigSet hybrid device memory limit");
+        }
     }
     CUDSS_TOKEN_CHECK(cudssDataCreate(e->handle, &e->data), "cudssDataCreate");
+
+    // CSR index widths are per-array and auto-detected from the buffer dtype
+    // (int32 or int64, independently for offsets and columns).
+    if ((offsets_buf.element_type() != ffi::DataType::S32 &&
+         offsets_buf.element_type() != ffi::DataType::S64) ||
+        (columns_buf.element_type() != ffi::DataType::S32 &&
+         columns_buf.element_type() != ffi::DataType::S64)) {
+        return ffi::Error::Internal(
+            "spineax: CSR offsets/columns dtype must be int32 or int64");
+    }
 
     // Point the descriptor at THIS call's buffers; every later phase repoints
     // at its own call's buffers before executing (zero-copy discipline).
     CUDSS_TOKEN_CHECK(cudssMatrixCreateCsr(&e->A, N, N, NNZ,
-        const_cast<int32_t*>(offsets_buf.typed_data()), NULL,
-        const_cast<int32_t*>(columns_buf.typed_data()),
+        offsets_buf.untyped_data(), NULL,
+        columns_buf.untyped_data(),
         const_cast<nat*>(csr_values_buf.typed_data()),
-        CUDSS_R_32I, CUDSS_R_32I, e->dtype,
+        cudss_index_type(offsets_buf.element_type(), "offsets"),
+        cudss_index_type(columns_buf.element_type(), "columns"), e->dtype,
         e->mtype, e->mview, CUDSS_BASE_ZERO), "cudssMatrixCreateCsr");
 
     // Placeholder dense descriptors: ANALYSIS/FACTORIZATION never dereference
@@ -418,8 +445,8 @@ template <ffi::DataType T>
 static ffi::Error PbatchTokenAnalyze(
     cudaStream_t stream,
     ffi::Buffer<T> csr_values_buf,
-    ffi::Buffer<ffi::S32> offsets_buf,
-    ffi::Buffer<ffi::S32> columns_buf,
+    ffi::AnyBuffer offsets_buf,
+    ffi::AnyBuffer columns_buf,
     ffi::Buffer<ffi::U32> fingerprint_buf,
     ffi::ResultBuffer<ffi::S32> token_buf,  // int32[1]
     const int64_t batch_size,
@@ -427,13 +454,15 @@ static ffi::Error PbatchTokenAnalyze(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t hybrid_device_memory_limit
 ) {
     std::shared_ptr<BatchFactorEntry> e;
     if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                    columns_buf, fingerprint_buf, batch_size,
                                    device_id, mtype_id, mview_id,
-                                   reordering_id, memory_id, &e);
+                                   reordering_id, memory_id,
+                                   hybrid_device_memory_limit, &e);
         err.failure()) return err;
     CUDA_TOKEN_CHECK(cudaEventRecord(e->done, stream));
     int32_t id = BatchTokenRegistry::instance().insert(std::move(e));
@@ -445,8 +474,8 @@ template <ffi::DataType T, bool kRefactorize>
 static ffi::Error PbatchTokenNumeric(
     cudaStream_t stream,
     ffi::Buffer<ffi::S32> token_in,         // 1 or B equal ids
-    ffi::Buffer<ffi::S32> offsets_buf,      // (B*n + 1,) expanded
-    ffi::Buffer<ffi::S32> columns_buf,      // (B*nnz,) expanded
+    ffi::AnyBuffer offsets_buf,             // (B*n + 1,) expanded (int32/int64)
+    ffi::AnyBuffer columns_buf,             // (B*nnz,) expanded (int32/int64)
     ffi::Buffer<ffi::U32> fingerprint_buf,  // uint32[2] structure checksum
     ffi::Buffer<T> csr_values_buf,          // (B*nnz,)
     ffi::ResultBuffer<ffi::S32> token_out,  // same count, FRESH id
@@ -454,7 +483,8 @@ static ffi::Error PbatchTokenNumeric(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t hybrid_device_memory_limit
 ) {
     auto& r = BatchTokenRegistry::instance();
     PhaseLease lease;
@@ -471,7 +501,8 @@ static ffi::Error PbatchTokenNumeric(
         if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
-                                       reordering_id, memory_id, &e);
+                                       reordering_id, memory_id,
+                                       hybrid_device_memory_limit, &e);
             err.failure()) return err;
         r.rebuilds.fetch_add(1);
     } else {
@@ -497,8 +528,8 @@ template <ffi::DataType T>
 static ffi::Error PbatchTokenSolve(
     cudaStream_t stream,
     ffi::Buffer<ffi::S32> token_in,         // 1 or B equal ids
-    ffi::Buffer<ffi::S32> offsets_buf,      // (B*n + 1,) expanded
-    ffi::Buffer<ffi::S32> columns_buf,      // (B*nnz,) expanded
+    ffi::AnyBuffer offsets_buf,             // (B*n + 1,) expanded (int32/int64)
+    ffi::AnyBuffer columns_buf,             // (B*nnz,) expanded (int32/int64)
     ffi::Buffer<ffi::U32> fingerprint_buf,  // uint32[2] structure checksum
     ffi::Buffer<T> csr_values_buf,          // (B*nnz,) — last-factorized values
     ffi::Buffer<T> b_values_buf,            // (B*n,) or (R, B*n) row-major
@@ -507,7 +538,8 @@ static ffi::Error PbatchTokenSolve(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t hybrid_device_memory_limit
 ) {
     PhaseLease lease;
     if (auto err = token_begin_phase<T>(stream, token_in, device_id, &lease);
@@ -521,7 +553,8 @@ static ffi::Error PbatchTokenSolve(
         if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
-                                       reordering_id, memory_id, &e);
+                                       reordering_id, memory_id,
+                                       hybrid_device_memory_limit, &e);
             err.failure()) return err;
         CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
             e->config, e->data, e->A, e->x_dummy, e->b_dummy),
@@ -575,8 +608,8 @@ template <ffi::DataType T>
 static ffi::Error PbatchTokenQuery(
     cudaStream_t stream,
     ffi::Buffer<ffi::S32> token_in,                    // 1 or B equal ids
-    ffi::Buffer<ffi::S32> offsets_buf,                 // (B*n + 1,) expanded
-    ffi::Buffer<ffi::S32> columns_buf,                 // (B*nnz,) expanded
+    ffi::AnyBuffer offsets_buf,                        // (B*n + 1,) expanded (int32/int64)
+    ffi::AnyBuffer columns_buf,                        // (B*nnz,) expanded (int32/int64)
     ffi::Buffer<ffi::U32> fingerprint_buf,             // uint32[2] structure checksum
     ffi::Buffer<T> csr_values_buf,                     // (B*nnz,) — last-factorized values
     ffi::ResultBuffer<ffi::S64> lu_nnz_buf,            // [1]
@@ -597,7 +630,8 @@ static ffi::Error PbatchTokenQuery(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t hybrid_device_memory_limit
 ) {
     PhaseLease lease;
     if (auto err = token_begin_phase<T>(stream, token_in, device_id, &lease);
@@ -610,7 +644,8 @@ static ffi::Error PbatchTokenQuery(
         if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
-                                       reordering_id, memory_id, &e);
+                                       reordering_id, memory_id,
+                                       hybrid_device_memory_limit, &e);
             err.failure()) return err;
         CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
             e->config, e->data, e->A, e->x_dummy, e->b_dummy),
@@ -693,8 +728,8 @@ static ffi::Error PbatchTokenQuery(
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<DataType>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::AnyBuffer>() \
+            .Arg<ffi::AnyBuffer>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Attr<int64_t>("batch_size") \
@@ -702,14 +737,15 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("hybrid_device_memory_limit")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenFactorize##TypeName, (PbatchTokenNumeric<DataType, false>), \
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::AnyBuffer>() \
+            .Arg<ffi::AnyBuffer>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
@@ -717,14 +753,15 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("hybrid_device_memory_limit")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenRefactorize##TypeName, (PbatchTokenNumeric<DataType, true>), \
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::AnyBuffer>() \
+            .Arg<ffi::AnyBuffer>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
@@ -732,14 +769,15 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("hybrid_device_memory_limit")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenSolve##TypeName, PbatchTokenSolve<DataType>, \
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::AnyBuffer>() \
+            .Arg<ffi::AnyBuffer>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
             .Arg<ffi::Buffer<DataType>>() \
@@ -748,14 +786,15 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("hybrid_device_memory_limit")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenQuery##TypeName, PbatchTokenQuery<DataType>, \
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
-            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::AnyBuffer>() \
+            .Arg<ffi::AnyBuffer>() \
             .Arg<ffi::Buffer<ffi::U32>>() \
             .Arg<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S64>>() \
@@ -776,7 +815,8 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id"));
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("hybrid_device_memory_limit"));
 
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f32, ffi::F32);
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f64, ffi::F64);
