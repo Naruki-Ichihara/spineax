@@ -281,6 +281,81 @@ def test_analyze_factorize_solve(dtype):
     assert _rel_err(A, x, b) < _TOL[dtype]
 
 
+def test_hybrid_device_memory_limit():
+    """memory="hybrid" with a small hybrid_device_memory_limit still solves
+    correctly (the limit only controls the GPU/host factor split), and the
+    limit round-trips onto the token as a static field."""
+    _require_gpu()
+    dtype = jnp.float64
+    values, offsets, columns, A = _sym_system(dtype=dtype)
+    b = jnp.asarray(
+        np.random.default_rng(7).standard_normal(A.shape[0]), dtype=dtype)
+
+    limit = 1 << 20  # 1 MiB cap on GPU-resident factors
+    token = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1,
+                          memory="hybrid", hybrid_device_memory_limit=limit)
+    assert token.hybrid_device_memory_limit == limit
+    assert token.memory_id == 1
+
+    token = cudss.factorize(token, values)
+    assert token.hybrid_device_memory_limit == limit  # rides through phases
+
+    x = cudss.solve(token, b)
+    assert _rel_err(A, x, b) < 1e-12
+
+
+@pytest.mark.parametrize(
+    "index_dtype, offset_dtype, column_dtype",
+    [
+        ("int32", jnp.int32, jnp.int32),
+        ("int64_offsets", jnp.int64, jnp.int32),
+        ("int64", jnp.int64, jnp.int64),
+    ],
+)
+def test_index_dtype_configs(index_dtype, offset_dtype, column_dtype):
+    """CSR index widths are configurable per array (offsets/columns int32 or
+    int64), auto-detected on the C++ side from the buffer dtype. Every config
+    must analyze+factorize+solve correctly; the token leaves carry the widths.
+
+    query()/inertia() is gated for the 64/64 config (int64 columns): cuDSS
+    returns int64 CUDSS_DATA_PERM_* arrays there while the query handler still
+    declares them int32, so it is a NotImplementedError rather than corrupt
+    output. factorize/solve are unaffected.
+    """
+    _require_gpu()
+    dtype = jnp.float64
+    values, offsets, columns, A = _sym_system(dtype=dtype)
+    b = jnp.asarray(
+        np.random.default_rng(37).standard_normal(A.shape[0]), dtype=dtype)
+
+    token = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1,
+                          index_dtype=index_dtype)
+    assert token.offsets.dtype == jnp.dtype(offset_dtype)
+    assert token.columns.dtype == jnp.dtype(column_dtype)
+
+    token = cudss.factorize(token, values)
+    # widths ride through the numeric phase unchanged
+    assert token.offsets.dtype == jnp.dtype(offset_dtype)
+    assert token.columns.dtype == jnp.dtype(column_dtype)
+
+    x = cudss.solve(token, b)
+    assert _rel_err(A, x, b) < 1e-10
+
+    if index_dtype == "int64":
+        with pytest.raises(NotImplementedError, match="int64 column indices"):
+            cudss.query(token)
+    else:
+        inertia = cudss.inertia(cudss.query(token))
+        np.testing.assert_array_equal(np.asarray(inertia), [A.shape[0], 0])
+
+
+def test_index_dtype_unknown_raises():
+    _require_gpu()
+    values, offsets, columns, _ = _sym_system()
+    with pytest.raises(ValueError, match="unknown index_dtype"):
+        cudss.analyze(values, offsets, columns, index_dtype="int16")
+
+
 @pytest.mark.parametrize("dtype", [jnp.complex64, jnp.complex128])
 def test_complex_general(dtype):
     _require_gpu()

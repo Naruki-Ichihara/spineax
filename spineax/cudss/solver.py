@@ -90,8 +90,8 @@ class FactorToken(eqx.Module):
 
     id: Array                                # int32[1] (+1 axis per vmap level) — traced
     values: Array                            # (nnz,) or (B, nnz)
-    offsets: Array                           # int32 (n+1,) or (B, n+1)
-    columns: Array                           # int32 (nnz,) or (B, nnz)
+    offsets: Array                           # (n+1,) or (B, n+1); int32/int64 (index_dtype)
+    columns: Array                           # (nnz,) or (B, nnz); int32/int64 (index_dtype)
     phase: str = eqx.field(static=True)      # "analyzed" | "factorized"
     kind: str = eqx.field(static=True)       # "single" | "pbatch" (descriptive)
     dtype: jnp.dtype = eqx.field(static=True)
@@ -103,6 +103,7 @@ class FactorToken(eqx.Module):
     device_id: int = eqx.field(static=True)
     reordering_id: int = eqx.field(static=True)  # cudssReorderingAlg_t 0-5
     memory_id: int = eqx.field(static=True)      # 0 device, 1 hybrid host+device
+    hybrid_device_memory_limit: int = eqx.field(static=True)  # bytes; 0 = cuDSS default
 
 
 def _structure_fingerprint(offsets_bd, columns_bd):
@@ -138,8 +139,11 @@ def _expand_structure(offsets, columns, batch_size):
     bandwidth-trivial, XLA-temporary — recomputed per phase call instead of
     persisting in device memory; the fingerprint rides the same pass.
     """
-    offsets = offsets.astype(jnp.int32)
-    columns = columns.astype(jnp.int32)
+    # The input arrays arrive already cast to the chosen index widths (from
+    # analyze, or from token.offsets/token.columns in later phases); the
+    # expansion PRESERVES those dtypes rather than forcing a fixed width, so
+    # a caller's index_dtype choice (int32 / int64 offsets / int64) flows
+    # through to cuDSS. The arithmetic is dtype-adaptive.
     if batch_size == 1:
         offsets_bd = offsets.reshape(-1)
         columns_bd = columns.reshape(-1)
@@ -150,9 +154,9 @@ def _expand_structure(offsets, columns, batch_size):
     shift = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
     offs_2d = offsets.reshape((-1, offsets.shape[-1]))  # any leading axes
     cols_2d = columns.reshape((-1, columns.shape[-1]))
-    body = (offs_2d[:, 1:] + shift * jnp.int32(nnz)).reshape(-1)
-    offsets_bd = jnp.concatenate([jnp.zeros((1,), jnp.int32), body])
-    columns_bd = (cols_2d + shift * jnp.int32(n)).reshape(-1)
+    body = (offs_2d[:, 1:] + shift * jnp.asarray(nnz, offsets.dtype)).reshape(-1)
+    offsets_bd = jnp.concatenate([jnp.zeros((1,), offsets.dtype), body])
+    columns_bd = (cols_2d + shift * jnp.asarray(n, columns.dtype)).reshape(-1)
     return offsets_bd, columns_bd, _structure_fingerprint(offsets_bd,
                                                           columns_bd)
 
@@ -276,7 +280,8 @@ def _ffi_call4(name, out_specs, *operands, has_side_effect=True, **attrs):
 # rides every phase call (not just analyze) so a non-resident id (renamed
 # away by a later numeric phase, or LRU-evicted) can be rebuilt in the
 # handler from the call's own operands (self-healing; see solver.cpp).
-_CFG_KEYS = ("device_id", "mtype_id", "mview_id", "reordering_id", "memory_id")
+_CFG_KEYS = ("device_id", "mtype_id", "mview_id", "reordering_id", "memory_id",
+             "hybrid_device_memory_limit")
 
 
 def _cfg_of(token):
@@ -414,6 +419,18 @@ _REORDERING_IDS = {"default": 0, "btf_colamd": 1, "colamd": 2, "amd": 3,
                    "nested_dissection": 4, "none": 5}
 _MEMORY_IDS = {"device": 0, "hybrid": 1}
 
+# CSR index widths, per array (offsets, columns). The cuDSS matrix carries the
+# two dtypes independently (auto-detected on the C++ side via ffi::AnyBuffer),
+# so a caller picks the pair by name:
+#   "int32"          — offsets int32, columns int32
+#   "int64_offsets"  — offsets int64, columns int32 (DEFAULT; current behaviour)
+#   "int64"          — offsets int64, columns int64
+_INDEX_DTYPES = {
+    "int32": (jnp.int32, jnp.int32),
+    "int64_offsets": (jnp.int64, jnp.int32),
+    "int64": (jnp.int64, jnp.int64),
+}
+
 
 def _knob_id(table, value, what):
     if not isinstance(value, str):
@@ -431,24 +448,41 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
             mview_id: str | int = "upper",
             device_id=0,
             reordering: str | int = "default",
-            memory: str | int = "device") -> FactorToken:
+            memory: str | int = "device",
+            hybrid_device_memory_limit: int = 0,
+            index_dtype: str = "int64_offsets") -> FactorToken:
     """``mtype_id``: "general", "symmetric", "hermitian", "spd" or "hpd".
     ``mview_id``: "full", "upper" or "lower".
     ``reordering``: "default", "btf_colamd", "colamd", "amd",
     "nested_dissection" or "none" (natural order).
     ``memory``: "device" (default) or "hybrid" host+device factors.
+    ``hybrid_device_memory_limit``: bytes of GPU memory the hybrid mode may
+    use (0 = cuDSS default = keep as much on GPU as possible); only meaningful
+    with ``memory="hybrid"``.
+    ``index_dtype``: CSR index widths, one of "int32" (offsets int32, columns
+    int32), "int64_offsets" (offsets int64, columns int32 — the DEFAULT,
+    matching the historical behaviour) or "int64" (offsets int64, columns
+    int64). The two widths are independent on the cuDSS matrix and are
+    auto-detected from the arrays' dtypes (no FFI attribute).
     Every knob also accepts the raw cuDSS enum int.
 
     Column indices may be unsorted but must be unique within each row.
     """
+    try:
+        offset_dtype, column_dtype = _INDEX_DTYPES[index_dtype]
+    except KeyError:
+        raise ValueError(
+            f"spineax tokens: unknown index_dtype {index_dtype!r} "
+            f"(one of: {', '.join(_INDEX_DTYPES)})") from None
     cfg = (int(device_id),
            _knob_id(_MTYPE_IDS, mtype_id, "mtype"),
            _knob_id(_MVIEW_IDS, mview_id, "mview"),
            _knob_id(_REORDERING_IDS, reordering, "reordering"),
-           _knob_id(_MEMORY_IDS, memory, "memory"))
+           _knob_id(_MEMORY_IDS, memory, "memory"),
+           int(hybrid_device_memory_limit))
     core = _make_analyze_ad(_suffix(jnp.dtype(csr_values.dtype)), cfg)
-    return core(csr_values, csr_offsets.astype(jnp.int32),
-                csr_columns.astype(jnp.int32))
+    return core(csr_values, csr_offsets.astype(offset_dtype),
+                csr_columns.astype(column_dtype))
 
 
 @lru_cache(maxsize=None)
@@ -698,6 +732,11 @@ def _matvec(token, x):
 def _raw_transpose_csr(values, offsets, columns):
     n = offsets.shape[0] - 1
     nnz = values.shape[0]
+    # The cuSPARSE transpose path is int32-only (legacy Xcsr2coo/Xcoosort); the
+    # token's row offsets are int64, so narrow them here. Transpose is used only
+    # for the general-matrix adjoint, where nnz < 2^31 (the C++ side guards).
+    offsets = jnp.asarray(offsets, dtype=jnp.int32)
+    columns = jnp.asarray(columns, dtype=jnp.int32)
     return tuple(_ffi_call4(
         f"spineax_csr_transpose_{_suffix(values.dtype)}",
         (
@@ -760,6 +799,8 @@ def _(axis_size, in_batched, values, offsets, columns):
 @jax.custom_batching.custom_vmap
 def _transpose_csr_order(offsets, columns):
     nnz = columns.shape[0]
+    offsets = jnp.asarray(offsets, dtype=jnp.int32)   # cuSPARSE transpose is int32-only
+    columns = jnp.asarray(columns, dtype=jnp.int32)
     identity = jnp.arange(nnz, dtype=jnp.int32)
     (order,) = _ffi_call4(
         "spineax_csr_transpose_order",
@@ -911,6 +952,14 @@ def _make_query(suffix, dtype, n, tree, cfg):
 
 def query(token: FactorToken) -> dict:
     _require_factorized(token, "query")
+    # With int64 column indices the cuDSS matrix uses indexType CUDSS_R_64I and
+    # cuDSS returns the CUDSS_DATA_PERM_* arrays as int64, but the query handler
+    # declares them int32 (and copies N*sizeof(int32)), so the perms come back
+    # corrupt. factorize/solve are unaffected; only query/inertia is gated.
+    if jnp.dtype(token.columns.dtype) == jnp.int64:
+        raise NotImplementedError(
+            "spineax query()/inertia() is not supported with int64 column "
+            "indices (index_dtype='int64'); use 'int64_offsets'")
     B = _batch_of(token)
     tree = int(_ps.nd_partition_tree_size())
     fn = _make_query(_suffix(token.dtype), token.dtype, B * token.n, tree,
@@ -1114,6 +1163,8 @@ class CuDSS(lx.AbstractLinearSolver):
     # cuDSS knobs (see ``analyze``): reordering algorithm and factor storage
     reordering: str = "default"
     memory: str = "device"
+    hybrid_device_memory_limit: int = 0  # bytes; 0 = cuDSS default (hybrid only)
+    index_dtype: str = "int64_offsets"   # CSR index widths (see ``analyze``)
 
     # explicit phases ----------------------------------------------------------
 
@@ -1124,7 +1175,9 @@ class CuDSS(lx.AbstractLinearSolver):
             mtype_id = 0
         return analyze(operator.values, operator.offsets, operator.columns,
                        mtype_id=mtype_id, mview_id=0,
-                       reordering=self.reordering, memory=self.memory)
+                       reordering=self.reordering, memory=self.memory,
+                       hybrid_device_memory_limit=self.hybrid_device_memory_limit,
+                       index_dtype=self.index_dtype)
 
     def factorize(self, token, operator):
         return factorize(token, operator.values)
@@ -1161,7 +1214,9 @@ class CuDSS(lx.AbstractLinearSolver):
         t_token = analyze(t_vals, t_offs, t_cols,
                           mtype_id=0, mview_id=0, device_id=state.device_id,
                           reordering=state.reordering_id,
-                          memory=state.memory_id)
+                          memory=state.memory_id,
+                          hybrid_device_memory_limit=state.hybrid_device_memory_limit,
+                          index_dtype=self.index_dtype)
         return factorize(t_token, t_token.values), options
 
     def conj(self, state, options):
@@ -1172,7 +1227,9 @@ class CuDSS(lx.AbstractLinearSolver):
                         mtype_id=state.mtype_id, mview_id=state.mview_id,
                         device_id=state.device_id,
                         reordering=state.reordering_id,
-                        memory=state.memory_id)
+                        memory=state.memory_id,
+                        hybrid_device_memory_limit=state.hybrid_device_memory_limit,
+                        index_dtype=self.index_dtype)
         return factorize(token, values), options
 
     def assume_full_rank(self):
